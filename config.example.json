@@ -1,0 +1,40 @@
+{
+  "mode": "research",
+  "exchange": {
+    "name": "okx",
+    "market": "SPOT",
+    "inst_id": "BTC-USDT",
+    "rest_url": "https://www.okx.com",
+    "td_mode": "cross",
+    "leverage": 3
+  },
+  "trading": {
+    "interval": "1H",
+    "slippage_bps": 5
+  },
+  "risk": {
+    "max_order_notional_usd": 1000,
+    "max_daily_notional_usd": 10000,
+    "max_position_notional_usd": 5000,
+    "max_orders_per_minute": 10,
+    "max_daily_loss_pct": 5,
+    "cooldown_after_reject_sec": 30
+  },
+  "strategy": {
+    "name": "grid",
+    "grid": {
+      "lower": 40000,
+      "upper": 80000,
+      "grids": 20,
+      "qty_per_grid": 0.001,
+      "spacing": "geo",
+      "stop_on_break": true
+    }
+  },
+  "dashboard": {
+    "enabled": true,
+    "listen": "127.0.0.1:8080",
+    "token": ""
+  },
+  "data_dir": "data"
+}
