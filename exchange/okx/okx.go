@@ -521,8 +521,8 @@ func (c *Client) GetCandlesHistory(ctx context.Context, symbol, interval string,
 	if total <= 0 {
 		total = 1000
 	}
-	if total > 20000 {
-		total = 20000 // 防误配打爆 API 配额
+	if total > 100000 {
+		total = 100000 // 防误配打爆 API 配额（1H 全历史约 7.7 万根）
 	}
 	var collected []exchange.Candle
 	seen := map[string]bool{}

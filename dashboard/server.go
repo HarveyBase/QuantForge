@@ -168,11 +168,19 @@ func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"orders": s.Ex.OpenOrders()})
+	orders := s.Ex.OpenOrders()
+	if orders == nil {
+		orders = []exchange.Order{} // research 模式 NoopExecutor 返回 nil：序列化为 [] 而非 null（前端空表兼容）
+	}
+	writeJSON(w, map[string]any{"orders": orders})
 }
 
 func (s *Server) handleRejections(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"rejections": s.Rk.Rejections()})
+	rejections := s.Rk.Rejections()
+	if rejections == nil {
+		rejections = []risk.Rejection{}
+	}
+	writeJSON(w, map[string]any{"rejections": rejections})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -246,6 +254,19 @@ func (s *Server) handleBacktest(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// nil 集合兜底为 []：前端对 null 取 .length 会崩整页
+	if res.Trades == nil {
+		res.Trades = []exchange.Order{}
+	}
+	if res.PendingOrders == nil {
+		res.PendingOrders = []exchange.Order{}
+	}
+	if res.RiskRejections == nil {
+		res.RiskRejections = []risk.Rejection{}
+	}
+	if res.EquityCurve == nil {
+		res.EquityCurve = []backtest.EquityPoint{}
 	}
 	writeJSON(w, res)
 }

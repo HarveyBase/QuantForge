@@ -8,7 +8,13 @@ import type {
   Status,
 } from './types'
 
-const token = localStorage.getItem('quantforge_token') ?? ''
+// 沙箱/隐私模式下 localStorage 可能被禁用（模块级裸调会抛 SecurityError 导致整站白屏）
+let token = ''
+try {
+  token = localStorage.getItem('quantforge_token') ?? ''
+} catch {
+  token = ''
+}
 const authHeaders = (): Record<string, string> =>
   token ? { Authorization: `Bearer ${token}` } : {}
 

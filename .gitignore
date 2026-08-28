@@ -38,10 +38,9 @@ go.work.sum
 bin/
 web/node_modules/
 web/dist/
-dashboard/webdist/*
-
-# Keep embed placeholder so go:embed always compiles
-!dashboard/webdist/.gitkeep
+# 前端构建产物随仓库分发（go:embed 编译期嵌入）：克隆后 go build 即得带 UI 的二进制；
+# 更新前端后需重新执行 embed.go 头部注释里的构建流程并重新编译
+# dashboard/webdist/*
 
 # Runtime data (snapshots / logs / backtest results)
 data/snapshots/

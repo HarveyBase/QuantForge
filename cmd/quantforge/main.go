@@ -739,7 +739,12 @@ func cmdFetch(args []string) error {
 	if !ok {
 		return fmt.Errorf("fetch 需要 okx 适配器（当前 %s）", a.ex.Name())
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// 超时按拉取量估算：每页 100 根、限频 10 页/秒 × 3 倍网络余量，下限 5 分钟
+	timeout := time.Duration(*bars/100) * 300 * time.Millisecond
+	if timeout < 5*time.Minute {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	raw, err := client.GetCandlesHistory(ctx, cfg.Exchange.InstID, cfg.Trading.Interval, *bars)
 	if err != nil {

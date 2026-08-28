@@ -43,6 +43,8 @@ export default function App() {
   const [btRunning, setBtRunning] = useState(false)
   const [btError, setBtError] = useState('')
   const [flash, setFlash] = useState('')
+  const [tripReason, setTripReason] = useState('')
+  const [killMsg, setKillMsg] = useState('')
 
   useEffect(() => {
     api.grid().then(setGrid).catch(() => {})
@@ -55,7 +57,7 @@ export default function App() {
       const msg = JSON.parse((e as MessageEvent).data)
       setFlash(`${new Date(msg.ts).toLocaleTimeString()} ${msg.kind}`)
     })
-    es.onerror = () => es.close()
+    // onerror 不主动 close：EventSource 浏览器自动重连（主动 close 会永久断连）
     return () => es.close()
   }, [])
 
@@ -70,23 +72,29 @@ export default function App() {
       setBtRunning(false)
     }
   }
+  const btDone = bt ? new Date(bt.sample_to).toLocaleString() : ''
 
   const trip = async () => {
-    const reason = window.prompt('触发 Kill Switch 的原因（必填）')
-    if (!reason) return
+    const reason = tripReason.trim()
+    if (!reason) {
+      setKillMsg('必须填写触发原因（审计留痕）')
+      return
+    }
     try {
       await api.killTrip(reason)
+      setTripReason('')
+      setKillMsg('已触发：撤单 + 停止一切新下单')
     } catch (e) {
-      window.alert(`触发失败: ${e}`)
+      setKillMsg(`触发失败: ${e}`)
     }
   }
 
   const reset = async () => {
-    if (!window.confirm('确认复位 Kill Switch？（需人工确认风险）')) return
     try {
       await api.killReset()
+      setKillMsg('已复位')
     } catch (e) {
-      window.alert(`复位失败: ${e}`)
+      setKillMsg(`复位失败: ${e}`)
     }
   }
 
@@ -156,23 +164,30 @@ export default function App() {
           )}
         </Card>
         <Card title="Kill Switch">
+          <input
+            className="ks-input"
+            placeholder="触发原因（必填，审计留痕）"
+            value={tripReason}
+            onChange={(e) => setTripReason(e.target.value)}
+          />
           <div className="btns">
             <button className="danger" onClick={trip}>
               触发停机（撤单+停止）
             </button>
             <button onClick={reset} disabled={!status?.kill_switch.tripped}>
-              复位（需确认）
+              复位
             </button>
           </div>
+          {killMsg && <div className="sub">{killMsg}</div>}
           {status?.kill_switch.tripped && (
-            <div className="sub warn">原因: {status.kill_switch.reason}</div>
+            <div className="sub warn">触发中: {status.kill_switch.reason}</div>
           )}
         </Card>
       </section>
 
       <section className="wide">
-        <Card title={`K 线${candles ? `（${candles.candles.length} 根）` : ''}`}>
-          {candles && candles.candles.length > 0 ? (
+        <Card title={`K 线${candles?.candles?.length ? `（${candles.candles.length} 根）` : ''}`}>
+          {candles?.candles && candles.candles.length > 0 ? (
             <CandleChart candles={candles.candles} />
           ) : (
             <Loading />
@@ -182,12 +197,12 @@ export default function App() {
 
       <div className="row">
         <section>
-          <Card title={`挂单（${orders?.orders.length ?? 0}）`}>
+          <Card title={`挂单（${orders?.orders?.length ?? 0}）`}>
             <OrdersTable orders={orders?.orders ?? []} />
           </Card>
         </section>
         <section>
-          <Card title={`风控拒单（${rejections?.rejections.length ?? 0}）`}>
+          <Card title={`风控拒单（${rejections?.rejections?.length ?? 0}）`}>
             <RejectionsTable rejections={rejections?.rejections ?? []} />
           </Card>
         </section>
@@ -206,6 +221,7 @@ export default function App() {
           {bt ? (
             <>
               <ul className="kv grid2">
+                <li>样本至: {btDone}</li>
                 <li>策略收益: {fmt(bt.metrics.total_return_pct)}%</li>
                 <li>基准(买入持有): {fmt(bt.metrics.buy_hold_pct)}%</li>
                 <li>最大回撤: {fmt(bt.metrics.max_drawdown_pct)}%</li>
@@ -215,7 +231,7 @@ export default function App() {
                 <li>交易次数: {bt.metrics.trade_count}</li>
                 <li>手续费: {fmt(bt.metrics.total_fees, 4)}</li>
                 <li>试验次数: {bt.num_trials}</li>
-                <li>拒单: {bt.risk_rejections.length}</li>
+                <li>拒单: {bt.risk_rejections?.length ?? 0}</li>
               </ul>
               <div className="sub warn">
                 回测输出不代表实盘收益；口径与限制见 docs/02、docs/08。

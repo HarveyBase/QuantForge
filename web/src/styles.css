@@ -178,3 +178,15 @@ td.reason { max-width: 320px; }
 @media (max-width: 800px) {
   .row { grid-template-columns: 1fr; }
 }
+
+.ks-input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #2a3a52;
+  background: #0f1420;
+  color: #d7dee9;
+  font-size: 13px;
+}
