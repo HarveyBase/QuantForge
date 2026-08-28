@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, streamURL } from './api'
+import type { ModeInfo, ReviewRecord } from './api'
 import type { BacktestResult, Candle, GridStats, Order, Rejection } from './types'
+
+declare global {
+  interface Window {
+    __liveConfirmValue?: string
+  }
+}
 
 const fmt = (v: number, digits = 2) =>
   v === undefined || v === null || Number.isNaN(v) ? '-' : v.toFixed(digits)
@@ -37,7 +44,8 @@ export default function App() {
   const status = usePolling(api.status, 2000)
   const orders = usePolling(api.orders, 3000)
   const rejections = usePolling(api.rejections, 5000)
-  const candles = usePolling(api.candles, 15000)
+  const [tf, setTf] = useState('1H')
+  const candles = usePolling(() => api.candles(tf), 15000)
   const [grid, setGrid] = useState<{ levels?: number[]; stats?: GridStats }>({})
   const [bt, setBt] = useState<BacktestResult | null>(null)
   const [btRunning, setBtRunning] = useState(false)
@@ -45,6 +53,9 @@ export default function App() {
   const [flash, setFlash] = useState('')
   const [tripReason, setTripReason] = useState('')
   const [killMsg, setKillMsg] = useState('')
+  const modeInfo = usePolling(api.mode, 5000)
+  const [modeMsg, setModeMsg] = useState('')
+  const reviews = usePolling(() => api.reviews(5), 15000)
 
   useEffect(() => {
     api.grid().then(setGrid).catch(() => {})
@@ -74,6 +85,24 @@ export default function App() {
   }
   const btDone = bt ? new Date(bt.sample_to).toLocaleString() : ''
 
+  const switchTo = async (m: string) => {
+    setModeMsg('')
+    let confirm: string | undefined
+    if (m === 'live') {
+      confirm = window.__liveConfirmValue
+      if (!confirm) {
+        setModeMsg('切 live 需先在确认框输入 I_UNDERSTAND_THE_RISK')
+        return
+      }
+    }
+    try {
+      await api.switchMode(m, confirm)
+      setModeMsg(`已切换到 ${MODE_BADGE[m] ?? m}`)
+    } catch (e) {
+      setModeMsg(String(e).replace('Error: ', ''))
+    }
+  }
+
   const trip = async () => {
     const reason = tripReason.trim()
     if (!reason) {
@@ -102,6 +131,7 @@ export default function App() {
     <div className="app">
       <header>
         <h1>QuantForge</h1>
+        <ModeSwitcher info={modeInfo} onSwitch={switchTo} msg={modeMsg} />
         {status && (
           <div className="badges">
             <span className={`badge mode-${status.mode}`}>
@@ -113,6 +143,12 @@ export default function App() {
             <span className={`badge ks-${status.kill_switch.tripped ? 'on' : 'off'}`}>
               Kill Switch {status.kill_switch.tripped ? '已触发' : '正常'}
             </span>
+            {status.regime && (
+              <span className={`badge regime-${status.regime.kind}`}>
+                市况: {status.regime.kind === 'trending' ? '趋势' : status.regime.kind === 'range' ? '震荡' : '过渡'}
+                {status.regime.er > 0 ? ` (ER ${status.regime.er.toFixed(2)})` : ''}
+              </span>
+            )}
             {flash && <span className="flash">{flash}</span>}
           </div>
         )}
@@ -186,7 +222,22 @@ export default function App() {
       </section>
 
       <section className="wide">
-        <Card title={`K 线${candles?.candles?.length ? `（${candles.candles.length} 根）` : ''}`}>
+        <Card
+          title={`K 线${candles?.candles?.length ? `（${candles.candles.length} 根）` : ''}`}
+          action={
+            <div className="tf-switch">
+              {['1H', '4H', '1D'].map((m) => (
+                <button
+                  key={m}
+                  className={tf === m ? 'tf-btn active' : 'tf-btn'}
+                  onClick={() => setTf(m)}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          }
+        >
           {candles?.candles && candles.candles.length > 0 ? (
             <CandleChart candles={candles.candles} />
           ) : (
@@ -207,6 +258,45 @@ export default function App() {
           </Card>
         </section>
       </div>
+
+      <section className="wide">
+        <Card title={`最近复盘（${reviews?.reviews?.length ?? 0} 份，每小时一份）`}>
+          {reviews?.reviews && reviews.reviews.length > 0 ? (
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>环境</th>
+                  <th>窗口收益</th>
+                  <th>买入持有</th>
+                  <th>成交</th>
+                  <th>拒单</th>
+                  <th>UMP拦截</th>
+                  <th>诊断</th>
+                </tr>
+              </thead>
+              <tbody>
+                {reviews.reviews.map((rv: ReviewRecord) => (
+                  <tr key={rv.ts}>
+                    <td>{new Date(rv.ts).toLocaleTimeString()}</td>
+                    <td>{MODE_BADGE[rv.stage] ?? rv.stage}</td>
+                    <td className={rv.window_ret_pct >= 0 ? 'up' : 'down'}>
+                      {rv.window_ret_pct.toFixed(2)}%
+                    </td>
+                    <td>{rv.price_chg_pct.toFixed(2)}%</td>
+                    <td>{rv.fills?.length ?? 0}</td>
+                    <td>{rv.rejections?.length ?? 0}</td>
+                    <td>{rv.ump_blocked}</td>
+                    <td className="reason">{rv.notes?.[0] ?? ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="sub">暂无复盘记录（每小时自动生成，服务运行满一个复盘周期后出现）</div>
+          )}
+        </Card>
+      </section>
 
       <section className="wide">
         <Card
@@ -242,6 +332,51 @@ export default function App() {
           )}
         </Card>
       </section>
+    </div>
+  )
+}
+
+function ModeSwitcher({
+  info,
+  onSwitch,
+  msg,
+}: {
+  info: ModeInfo | null
+  onSwitch: (m: string) => void
+  msg: string
+}) {
+  const [liveConfirm, setLiveConfirm] = useState('')
+  if (!info) return <div className="mode-switch sub">环境加载中…</div>
+  const labels: Record<string, string> = { research: '回测', paper: '模拟盘', live: '实盘' }
+  return (
+    <div className="mode-switch">
+      {(info.switchable ?? []).map((m) => (
+        <button
+          key={m}
+          className={info.active === m ? 'mode-btn active' : 'mode-btn'}
+          onClick={() => onSwitch(m)}
+        >
+          {labels[m] ?? m}
+        </button>
+      ))}
+      <span className={`badge mode-${info.active}`}>
+        当前: {labels[info.active] ?? info.active} / 启动: {labels[info.boot] ?? info.boot}
+      </span>
+      {info.boot === 'live' && (
+        <input
+          className="ks-input live-confirm"
+          placeholder="live 确认词 I_UNDERSTAND_THE_RISK"
+          value={liveConfirm}
+          onChange={(e) => {
+            setLiveConfirm(e.target.value)
+            window.__liveConfirmValue = e.target.value
+          }}
+        />
+      )}
+      {msg && <span className="sub">{msg}</span>}
+      {info.boot !== 'live' && (
+        <span className="sub">升 live 需 live 配置重启 + 环境变量门禁（安全红线）</span>
+      )}
     </div>
   )
 }
@@ -326,37 +461,87 @@ function RejectionsTable({ rejections }: { rejections: Rejection[] }) {
 
 function CandleChart({ candles }: { candles: Candle[] }) {
   const ref = useRef<HTMLDivElement>(null)
+  const tipRef = useRef<HTMLDivElement>(null)
+  const legendRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     let cleanup: (() => void) | undefined
     let cancelled = false
-    import('lightweight-charts').then(({ createChart }) => {
+    import('lightweight-charts').then(({ createChart, CrosshairMode }) => {
       if (cancelled || !ref.current) return
       const chart = createChart(ref.current, {
-        height: 320,
+        height: 360,
         layout: { background: { color: '#0f1420' }, textColor: '#9aa4b2' },
-        grid: {
-          vertLines: { color: '#1a2233' },
-          horzLines: { color: '#1a2233' },
+        grid: { vertLines: { color: '#1a2233' }, horzLines: { color: '#1a2233' } },
+        crosshair: {
+          mode: CrosshairMode.Normal,
+          vertLine: { color: '#3b82f6', labelBackgroundColor: '#1d4ed8' },
+          horzLine: { color: '#3b82f6', labelBackgroundColor: '#1d4ed8' },
         },
-        timeScale: { timeVisible: true, borderVisible: false },
+        rightPriceScale: { borderColor: '#1a2233' },
+        timeScale: { timeVisible: true, secondsVisible: false, borderVisible: false },
       })
       const series = chart.addCandlestickSeries({
-        upColor: '#22c55e',
-        downColor: '#ef4444',
-        wickUpColor: '#22c55e',
-        wickDownColor: '#ef4444',
-        borderVisible: false,
+        upColor: '#22c55e', downColor: '#ef4444',
+        wickUpColor: '#22c55e', wickDownColor: '#ef4444', borderVisible: false,
       })
       series.setData(
         candles.map((c) => ({
           time: (c.open_time / 1000) as never,
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
+          open: c.open, high: c.high, low: c.low, close: c.close,
         })),
       )
+      const vol = chart.addHistogramSeries({
+        priceFormat: { type: 'volume' },
+        priceScaleId: 'vol',
+      })
+      chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
+      vol.setData(
+        candles.map((c) => ({
+          time: (c.open_time / 1000) as never,
+          value: c.volume,
+          color: c.close >= c.open ? 'rgba(34,197,94,0.45)' : 'rgba(239,68,68,0.45)',
+        })),
+      )
+      const lastBar = candles[candles.length - 1]
+      if (lastBar) {
+        series.createPriceLine({
+          price: lastBar.close,
+          color: lastBar.close >= lastBar.open ? '#22c55e' : '#ef4444',
+          lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '最新',
+        })
+      }
       chart.timeScale().fitContent()
+      const barHTML = (c: Candle) => {
+        const chg = ((c.close - c.open) / c.open) * 100
+        const cls = chg >= 0 ? 'tt-up' : 'tt-down'
+        return (
+          '<b>' + new Date(c.open_time).toLocaleString() + '</b>　' +
+          '开 ' + fmt(c.open) + '　高 ' + fmt(c.high) + '　低 ' + fmt(c.low) +
+          '　收 <span class="' + cls + '">' + fmt(c.close) + '</span>' +
+          '　<span class="' + cls + '">' + (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%</span>' +
+          '　量 ' + (c.volume >= 1000 ? (c.volume / 1000).toFixed(1) + 'K' : c.volume.toFixed(2))
+        )
+      }
+      const byTime = new Map(candles.map((c) => [Math.floor(c.open_time / 1000), c]))
+      if (legendRef.current && lastBar) legendRef.current.innerHTML = barHTML(lastBar)
+      chart.subscribeCrosshairMove((param) => {
+        const t = param.time as number | undefined
+        const c = t ? byTime.get(t) : undefined
+        if (!c || !param.point) {
+          if (tipRef.current) tipRef.current.style.display = 'none'
+          if (legendRef.current && lastBar) legendRef.current.innerHTML = barHTML(lastBar)
+          return
+        }
+        const html = barHTML(c)
+        if (legendRef.current) legendRef.current.innerHTML = html
+        if (tipRef.current) {
+          tipRef.current.innerHTML = html
+          tipRef.current.style.display = 'block'
+          const w = ref.current?.clientWidth ?? 600
+          tipRef.current.style.left = Math.min(param.point.x + 18, w - 330) + 'px'
+          tipRef.current.style.top = Math.max(param.point.y - 10, 4) + 'px'
+        }
+      })
       const onResize = () => chart.applyOptions({ width: ref.current?.clientWidth })
       window.addEventListener('resize', onResize)
       cleanup = () => {
@@ -369,5 +554,11 @@ function CandleChart({ candles }: { candles: Candle[] }) {
       cleanup?.()
     }
   }, [candles])
-  return <div ref={ref} className="chart" />
+  return (
+    <div style={{ position: 'relative' }}>
+      <div ref={legendRef} className="chart-legend" />
+      <div ref={ref} className="chart" />
+      <div ref={tipRef} className="chart-tooltip" style={{ display: 'none' }} />
+    </div>
+  )
 }

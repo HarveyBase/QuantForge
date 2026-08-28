@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/HarveyBase/QuantForge/backtest"
+	"github.com/HarveyBase/QuantForge/candlestore"
 	"github.com/HarveyBase/QuantForge/config"
 	"github.com/HarveyBase/QuantForge/dashboard"
 	"github.com/HarveyBase/QuantForge/exchange"
@@ -96,12 +97,14 @@ type app struct {
 	pol        *market.Poller
 	snap       *market.SnapshotStore
 	reviewer   *review.Reviewer
-	reviewing  atomic.Bool      // 复盘进行中：暂停新下单（行情照收，复盘完自动恢复）
-	regimeDet  *regime.Detector // 市况识别（信息面：震荡/趋势留痕，自动路由待回测证据）
-	store      *state.Store     // 运行态持久化：重启恢复游标/试验数/Kill 状态
-	umpFilter  *ump.Filter      // grid 买信号拦截器（启动自举+运行累积；已过样本外验证 docs/10 §5B）
-	umpOn      bool             // 拦截开关（config.ump.enabled，默认开：拦截只减少下单不增加风险）
-	umpBlocked atomic.Int64     // 窗口内拦截计数（复盘留痕）
+	reviewing  atomic.Bool        // 复盘进行中：暂停新下单（行情照收，复盘完自动恢复）
+	regimeDet  *regime.Detector   // 市况识别（信息面：震荡/趋势留痕，自动路由待回测证据）
+	store      *state.Store       // 运行态持久化：重启恢复游标/试验数/Kill 状态
+	candlesDB  *candlestore.Store // SQLite K 线缓存库（fetch 历史 + 实时收盘增量统一入库）
+	umpFilter  *ump.Filter        // grid 买信号拦截器（启动自举+运行累积；已过样本外验证 docs/10 §5B）
+	umpOn      bool               // 拦截开关（config.ump.enabled，默认开：拦截只减少下单不增加风险）
+	umpBlocked atomic.Int64       // 窗口内拦截计数（复盘留痕）
+	activeMode atomic.Value       // 当前活跃环境（research/paper；live 仅当启动配置为 live）
 
 	candles    []exchange.Candle // 最近已确认序列
 	lastCandle int64             // 已处理的最新收盘 OpenTime（防重复驱动策略）
@@ -187,6 +190,11 @@ func buildApp(cfg *config.Config) (*app, error) {
 	}
 	a.reviewer = rev
 	a.regimeDet = regime.NewDetector(regime.DefaultLookback, regime.DefaultConfirmBars)
+	if db, derr := candlestore.Open(cfg.DataDir); derr == nil {
+		a.candlesDB = db
+	} else {
+		log.Printf("K 线库打开失败（图表将回退内存缓存）: %v", derr)
+	}
 	// 运行态恢复：游标（防重启重复驱动策略）、试验计数、Kill Switch 状态
 	a.store = state.New(cfg.DataDir)
 	if st, err := a.store.Load(); err != nil {
@@ -200,6 +208,7 @@ func buildApp(cfg *config.Config) (*app, error) {
 			rk.Kill.Restore(true, st.KillReason)
 			log.Printf("Kill Switch 处于触发状态（%s），继续停机", st.KillReason)
 		}
+		a.activeMode.Store(string(cfg.Mode)) // 活跃环境初始 = 启动配置（页面可降级；升级受门禁）
 		if len(st.UMP) > 0 && a.umpFilter != nil {
 			snap := make(map[[3]int][2]int, len(st.UMP))
 			for _, c := range st.UMP {
@@ -238,8 +247,14 @@ func (a *app) onCandles(candles []exchange.Candle) {
 	if _, err := a.snap.Save(snapshotName(a.cfg), candles); err != nil {
 		log.Printf("snapshot 保存失败: %v", err)
 	}
-	if a.cfg.Mode == config.ModeResearch || a.exec == nil {
-		return // 研究模式不下单
+	// 已确认 K 线增量入库（SQLite 缓存库，图表/回测读全历史）
+	if a.candlesDB != nil {
+		if err := a.candlesDB.Upsert(candles); err != nil {
+			log.Printf("K 线入库失败: %v", err)
+		}
+	}
+	if a.ActiveMode() == config.ModeResearch || a.exec == nil {
+		return // 活跃环境为研究模式（页面可切）：只看不下单
 	}
 	if a.reviewing.Load() {
 		log.Printf("复盘进行中，本根收盘信号跳过下单（复盘完自动恢复）")
@@ -472,6 +487,23 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 		return append([]exchange.Candle(nil), a.candles...)
 	}, runBacktest)
 	srv.RecentReviews = a.reviewer.Recent
+	srv.Candles = func(interval string, limit int) []exchange.Candle {
+		if interval == "" {
+			interval = cfg.Trading.Interval
+		}
+		if a.candlesDB != nil {
+			if cs, err := a.candlesDB.Latest("okx", cfg.Exchange.InstID, interval, limit); err == nil && len(cs) > 0 {
+				return cs
+			}
+		}
+		// 库空回退内存缓存（仅默认周期）
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		return append([]exchange.Candle(nil), a.candles...)
+	}
+	srv.ActiveMode = a.ActiveMode
+	srv.BootMode = cfg.Mode
+	srv.SwitchMode = a.SwitchMode
 	srv.Regime = func() regime.Reading {
 		return regime.Reading{Kind: a.regimeDet.Current(), Lookback: regime.DefaultLookback, Confirm: regime.DefaultConfirmBars}
 	}
@@ -512,6 +544,38 @@ func (a *app) persistState() {
 	if err := a.store.Save(st); err != nil {
 		log.Printf("state 落盘失败: %v", err)
 	}
+}
+
+// ActiveMode 当前活跃环境（页面热切目标；未初始化回退启动配置）。
+func (a *app) ActiveMode() config.Mode {
+	if v, ok := a.activeMode.Load().(string); ok && v != "" {
+		return config.Mode(v)
+	}
+	return a.cfg.Mode
+}
+
+// SwitchMode 页面热切活跃环境。
+// 权限矩阵（docs/08 门禁纪律）：research↔paper 自由切；
+// 目标 live 仅当启动配置本身就是 live（升级必须重启 + 环境变量门禁 + 确认词，页面不得一键进实盘）。
+func (a *app) SwitchMode(target config.Mode, confirm string) error {
+	switch target {
+	case config.ModeResearch, config.ModePaper:
+		// paper 需要执行器（research 启动的进程没装配）
+		if target == config.ModePaper && a.exec == nil {
+			return fmt.Errorf("本进程以 research 配置启动，未装配执行器——切换 paper 需以 paper 配置重启")
+		}
+	case config.ModeLive:
+		if a.cfg.Mode != config.ModeLive {
+			return fmt.Errorf("live 升级必须以 live 配置重启进程 + 环境变量门禁（%s），页面不得一键进入实盘", config.LiveGateEnv)
+		}
+		if confirm != "I_UNDERSTAND_THE_RISK" {
+			return fmt.Errorf("切回 live 需要确认词 I_UNDERSTAND_THE_RISK")
+		}
+	default:
+		return fmt.Errorf("未知环境 %q", target)
+	}
+	a.activeMode.Store(string(target))
+	return nil
 }
 
 // fetchCandles 数据降级链（docs/02 完整性优先）：缓存 → 实时拉取 → 快照 → 固定样本。
@@ -764,6 +828,15 @@ func cmdFetch(args []string) error {
 	b, _ := json.MarshalIndent(clean, "", " ")
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		return err
+	}
+	// 同步入库 SQLite 缓存库（图表/回测统一数据面）
+	if db, derr := candlestore.Open(cfg.DataDir); derr == nil {
+		if uerr := db.Upsert(clean); uerr != nil {
+			log.Printf("fetch 入库失败: %v", uerr)
+		} else if n, _ := db.Count("okx", cfg.Exchange.InstID, cfg.Trading.Interval); n > 0 {
+			fmt.Printf("已入库 SQLite：%d 根 %s K 线（data/candles.db）\n", n, cfg.Trading.Interval)
+		}
+		db.Close()
 	}
 	first, last := clean[0], clean[len(clean)-1]
 	fmt.Printf("已固化 %d 根 %s K 线到 %s\n区间: %s ~ %s\n",

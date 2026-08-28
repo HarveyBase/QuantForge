@@ -17,6 +17,7 @@ import (
 
 	"github.com/HarveyBase/QuantForge/backtest"
 	"github.com/HarveyBase/QuantForge/config"
+	"github.com/HarveyBase/QuantForge/dashboard"
 	"github.com/HarveyBase/QuantForge/exchange"
 	"github.com/HarveyBase/QuantForge/exchange/okx"
 	"github.com/HarveyBase/QuantForge/ump"
@@ -666,4 +667,117 @@ func TestUMPStatePersistRestore(t *testing.T) {
 // umpExtractFor 提取当前最新已收盘根的情境特征（测试辅助）。
 func umpExtractFor(a *app, candles []exchange.Candle) (ump.Features, error) {
 	return ump.Extract(candles, len(candles)-1)
+}
+
+func TestActiveModeSwitchFlow(t *testing.T) {
+	t.Setenv("OKX_API_KEY", "k")
+	t.Setenv("OKX_SECRET", "s")
+	t.Setenv("OKX_PASSPHRASE", "p")
+	cfg := mockOKX(t)
+	cfg.Mode = config.ModePaper
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	if a.ActiveMode() != config.ModePaper {
+		t.Fatal("初始活跃环境应为启动配置")
+	}
+	// paper → research：热切后行情照收、信号不下单
+	if err := a.SwitchMode(config.ModeResearch, ""); err != nil {
+		t.Fatal(err)
+	}
+	a.onCandles(genCandles(60))
+	// → paper 恢复下单
+	if err := a.SwitchMode(config.ModePaper, ""); err != nil {
+		t.Fatal(err)
+	}
+	// paper 启动切 live 必须拒（红线）
+	if err := a.SwitchMode(config.ModeLive, "I_UNDERSTAND_THE_RISK"); err == nil {
+		t.Fatal("paper 启动页面上切 live 必须被拒绝")
+	}
+	// research 启动的进程：切 paper 被拒（无执行器）
+	cfg2 := mockOKX(t)
+	cfg2.Mode = config.ModeResearch
+	a2, _ := buildApp(cfg2)
+	if err := a2.SwitchMode(config.ModePaper, ""); err == nil {
+		t.Fatal("research 启动（无执行器）切 paper 必须被拒绝")
+	}
+}
+
+// TestLiveBootModeMatrix live 门禁真实链路实测：
+// QUANTFORGE_ALLOW_LIVE 通过 + live 配置 buildApp → dashboard serve →
+// /api/mode 应含三档可切；切 live 需确认词；降级自由。
+func TestLiveBootModeMatrix(t *testing.T) {
+	t.Setenv("QUANTFORGE_ALLOW_LIVE", config.LiveGateValue)
+	t.Setenv("OKX_API_KEY", "k")
+	t.Setenv("OKX_SECRET", "s")
+	t.Setenv("OKX_PASSPHRASE", "p")
+	cfg := mockOKX(t)
+	cfg.Mode = config.ModeLive // live 启动（门禁已过）
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatalf("live 门禁 + mock 凭据应能完成装配: %v", err)
+	}
+	defer a.exec.Stop()
+	if a.ActiveMode() != config.ModeLive {
+		t.Fatal("live 启动初始活跃环境应为 live")
+	}
+	// 真实 dashboard 链路（与 cmdServe 同一装配路径）
+	srv := dashboard.New(cfg, a.pf, a.rk, a.exec, a.grid, nil, nil)
+	srv.ActiveMode = a.ActiveMode
+	srv.BootMode = cfg.Mode
+	srv.SwitchMode = a.SwitchMode
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// GET /api/mode：live 启动 → switchable 必须含三档
+	resp, _ := http.Get(ts.URL + "/api/mode")
+	var modeBody struct {
+		Active     string   `json:"active"`
+		Boot       string   `json:"boot"`
+		Switchable []string `json:"switchable"`
+	}
+	json.NewDecoder(resp.Body).Decode(&modeBody)
+	resp.Body.Close()
+	if modeBody.Active != "live" || modeBody.Boot != "live" {
+		t.Fatalf("live 启动状态错误: %+v", modeBody)
+	}
+	want := map[string]bool{"research": false, "paper": false, "live": false}
+	for _, m := range modeBody.Switchable {
+		want[m] = true
+	}
+	for m, ok := range want {
+		if !ok {
+			t.Fatalf("live 启动 switchable 缺少 %s: %v", m, modeBody.Switchable)
+		}
+	}
+
+	post := func(body string) int {
+		r, _ := http.Post(ts.URL+"/api/mode", "application/json", strings.NewReader(body))
+		r.Body.Close()
+		return r.StatusCode
+	}
+	// 三档矩阵
+	if c := post(`{"mode":"live"}`); c != 403 {
+		t.Fatalf("切 live 无确认词必须 403: %d", c)
+	}
+	if c := post(`{"mode":"live","confirm":"I_UNDERSTAND_THE_RISK"}`); c != 200 {
+		t.Fatalf("live 启动 + 确认词切 live 应 200: %d", c)
+	}
+	if c := post(`{"mode":"paper"}`); c != 200 {
+		t.Fatalf("live 降级 paper 应 200: %d", c)
+	}
+	if a.ActiveMode() != config.ModePaper {
+		t.Fatal("降级后活跃环境应为 paper")
+	}
+	if c := post(`{"mode":"research"}`); c != 200 {
+		t.Fatalf("paper 降级 research 应 200: %d", c)
+	}
+	if c := post(`{"mode":"live","confirm":"I_UNDERSTAND_THE_RISK"}`); c != 200 {
+		t.Fatalf("research 活跃（live 启动）切回 live+确认词应 200: %d", c)
+	}
+	if a.ActiveMode() != config.ModeLive {
+		t.Fatal("切回后活跃环境应为 live")
+	}
 }

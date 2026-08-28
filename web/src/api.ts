@@ -45,9 +45,37 @@ export const api = {
   positions: () => get<{ cash: number; positions: Position[] }>('/api/positions'),
   orders: () => get<{ orders: Order[] }>('/api/orders'),
   rejections: () => get<{ rejections: Rejection[] }>('/api/rejections'),
-  candles: () => get<{ candles: Candle[] }>('/api/candles'),
+  candles: (interval?: string, limit = 2000) =>
+    get<{ candles: Candle[]; interval?: string }>(
+      `/api/candles?limit=${limit}${interval ? `&interval=${interval}` : ''}`,
+    ),
   grid: () => get<{ levels?: number[]; stats?: GridStats }>('/api/grid'),
   backtest: () => post<BacktestResult>('/api/backtest', {}),
   killTrip: (reason: string) => post('/api/killswitch', { action: 'trip', reason }),
   killReset: () => post('/api/killswitch', { action: 'reset', confirm: 'RESET' }),
+  mode: () => get<ModeInfo>('/api/mode'),
+  switchMode: (mode: string, confirm?: string) =>
+    post('/api/mode', { mode, confirm: confirm ?? '' }),
+  reviews: (n = 10) => get<{ reviews: ReviewRecord[] }>(`/api/reviews?n=${n}`),
+}
+
+export interface ModeInfo {
+  active: string
+  boot: string
+  switchable: string[]
+  gate_env: string
+  gate_value: string
+}
+
+export interface ReviewRecord {
+  stage: string
+  ts: string
+  window_ret_pct: number
+  price_chg_pct: number
+  fills: { side: string; qty: number; price: number }[] | null
+  rejections: unknown[] | null
+  ump_blocked: number
+  kill_tripped: boolean
+  notes: string[] | null
+  strategy: string
 }

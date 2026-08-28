@@ -32,10 +32,15 @@ type Server struct {
 	Rk            *risk.Manager
 	Ex            OrderSource
 	Grid          *grid.Grid
-	Snapshots     func() []exchange.Candle // 最近已确认 K 线
+	Snapshots     func() []exchange.Candle                           // 最近已确认 K 线
+	Candles       func(interval string, limit int) []exchange.Candle // SQLite 库读取（任意周期/全历史）
 	RunBacktest   func(ctx context.Context) (*backtest.Result, error)
 	RecentReviews func(n int) []review.Record // 最近 n 份小时复盘
 	Regime        func() regime.Reading       // 当前市况读数
+	// ModeSwap 页面热切活跃环境（research↔paper；live 受启动配置门禁，见 cmd.SwitchMode）
+	ActiveMode func() config.Mode // 当前活跃环境
+	BootMode   config.Mode        // 启动配置环境（能力上界）
+	SwitchMode func(config.Mode, string) error
 
 	mu      sync.Mutex
 	subs    map[chan []byte]struct{}
@@ -80,6 +85,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/events", s.auth(s.handleEvents))
 	mux.HandleFunc("GET /api/candles", s.auth(s.handleCandles))
 	mux.HandleFunc("GET /api/grid", s.auth(s.handleGrid))
+	mux.HandleFunc("GET /api/mode", s.auth(s.handleGetMode))
+	mux.HandleFunc("POST /api/mode", s.auth(s.handleSwitchMode))
 	mux.HandleFunc("POST /api/killswitch", s.auth(s.handleKillSwitch))
 	mux.HandleFunc("POST /api/backtest", s.auth(s.handleBacktest))
 	mux.HandleFunc("GET /api/reviews", s.auth(s.handleReviews))
@@ -188,6 +195,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCandles(w http.ResponseWriter, r *http.Request) {
+	interval := r.URL.Query().Get("interval")
+	limit := 300
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 5000 {
+			limit = n
+		}
+	}
+	if s.Candles != nil {
+		writeJSON(w, map[string]any{"candles": s.Candles(interval, limit), "interval": interval})
+		return
+	}
 	writeJSON(w, map[string]any{"candles": s.Snapshots()})
 }
 
@@ -198,6 +216,48 @@ func (s *Server) handleGrid(w http.ResponseWriter, r *http.Request) {
 		resp["stats"] = s.Grid.Stats()
 	}
 	writeJSON(w, resp)
+}
+
+// handleGetMode 环境状态：活跃环境 + 启动配置上界 + 可切换项。
+func (s *Server) handleGetMode(w http.ResponseWriter, r *http.Request) {
+	active := s.Cfg.Mode
+	if s.ActiveMode != nil {
+		active = s.ActiveMode()
+	}
+	switchable := []config.Mode{config.ModeResearch}
+	if s.BootMode == config.ModePaper || s.BootMode == config.ModeLive {
+		switchable = append(switchable, config.ModePaper)
+	}
+	if s.BootMode == config.ModeLive {
+		switchable = append(switchable, config.ModeLive)
+	}
+	writeJSON(w, map[string]any{
+		"active": active, "boot": s.BootMode, "switchable": switchable,
+		"gate_env": config.LiveGateEnv, "gate_value": config.LiveGateValue,
+	})
+}
+
+// handleSwitchMode 页面热切活跃环境。
+// 升级纪律（docs/08）：live 只能来自 live 启动配置 + 确认词；research 启动无执行器不可切 paper。
+func (s *Server) handleSwitchMode(w http.ResponseWriter, r *http.Request) {
+	if s.SwitchMode == nil {
+		http.Error(w, "本部署不支持环境切换", http.StatusNotImplemented)
+		return
+	}
+	var req struct {
+		Mode    config.Mode `json:"mode"`
+		Confirm string      `json:"confirm"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "请求体非法", http.StatusBadRequest)
+		return
+	}
+	if err := s.SwitchMode(req.Mode, req.Confirm); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	s.Broadcast("mode_switch", map[string]any{"mode": req.Mode})
+	writeJSON(w, map[string]any{"active": req.Mode})
 }
 
 // handleKillSwitch 唯一高危可写操作：trip 需 reason；reset 需确认词（防误触）。

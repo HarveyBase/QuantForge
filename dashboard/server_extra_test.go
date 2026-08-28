@@ -351,3 +351,84 @@ func TestReviewsEndpoint(t *testing.T) {
 		t.Fatalf("nil 注入应安全: %d", resp2.StatusCode)
 	}
 }
+
+func TestModeSwitchPermissionMatrix(t *testing.T) {
+	newSrv := func(boot config.Mode, hasExec bool) *Server {
+		s := newServerForTest(t)
+		s.BootMode = boot
+		s.ActiveMode = func() config.Mode { return boot }
+		s.SwitchMode = func(m config.Mode, confirm string) error {
+			switch m {
+			case config.ModeResearch:
+				return nil
+			case config.ModePaper:
+				if !hasExec {
+					return fmt.Errorf("research 启动无执行器")
+				}
+				return nil
+			case config.ModeLive:
+				if boot != config.ModeLive {
+					return fmt.Errorf("live 需 live 配置重启 + 门禁")
+				}
+				if confirm != "I_UNDERSTAND_THE_RISK" {
+					return fmt.Errorf("需确认词")
+				}
+				return nil
+			}
+			return fmt.Errorf("未知环境")
+		}
+		return s
+	}
+	post := func(s *Server, body string) int {
+		srv := httptest.NewServer(s.Handler())
+		defer srv.Close()
+		resp, _ := http.Post(srv.URL+"/api/mode", "application/json", strings.NewReader(body))
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// research 启动：可切 research；切 paper 被拒（无执行器）；切 live 被拒
+	s1 := newSrv(config.ModeResearch, false)
+	if c := post(s1, `{"mode":"research"}`); c != 200 {
+		t.Fatalf("research→research 应允许: %d", c)
+	}
+	if c := post(s1, `{"mode":"paper"}`); c != 403 {
+		t.Fatalf("research 启动切 paper 应 403: %d", c)
+	}
+	if c := post(s1, `{"mode":"live","confirm":"I_UNDERSTAND_THE_RISK"}`); c != 403 {
+		t.Fatalf("research 启动切 live 必须 403（红线）: %d", c)
+	}
+	// paper 启动：research↔paper 自由；live 仍拒
+	s2 := newSrv(config.ModePaper, true)
+	if c := post(s2, `{"mode":"paper"}`); c != 200 {
+		t.Fatalf("paper→paper 应允许: %d", c)
+	}
+	if c := post(s2, `{"mode":"live","confirm":"I_UNDERSTAND_THE_RISK"}`); c != 403 {
+		t.Fatalf("paper 启动切 live 必须 403: %d", c)
+	}
+	// live 启动：无确认词拒；有确认词允许；可降级 paper/research
+	s3 := newSrv(config.ModeLive, true)
+	if c := post(s3, `{"mode":"live"}`); c != 403 {
+		t.Fatalf("live 无确认词应 403: %d", c)
+	}
+	if c := post(s3, `{"mode":"live","confirm":"I_UNDERSTAND_THE_RISK"}`); c != 200 {
+		t.Fatalf("live 启动+确认词切 live 应允许: %d", c)
+	}
+	if c := post(s3, `{"mode":"paper"}`); c != 200 {
+		t.Fatalf("live 降级 paper 应允许: %d", c)
+	}
+	// GET /api/mode
+	s4 := newSrv(config.ModePaper, true)
+	srv := httptest.NewServer(s4.Handler())
+	defer srv.Close()
+	resp, _ := http.Get(srv.URL + "/api/mode")
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if body["active"] != "paper" || body["boot"] != "paper" {
+		t.Fatalf("mode 状态错误: %v", body)
+	}
+	// 未知环境
+	if c := post(s4, `{"mode":"yolo"}`); c != 403 {
+		t.Fatalf("未知环境应 403: %d", c)
+	}
+}

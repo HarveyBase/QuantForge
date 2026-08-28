@@ -1,5 +1,13 @@
 // 后端 API 类型（与 Go 结构体对齐）
+export interface Regime {
+  kind: string
+  er: number
+  lookback: number
+  confirm: number
+}
+
 export interface Status {
+  regime?: Regime
   version: string
   mode: 'research' | 'paper' | 'live'
   exchange: string
