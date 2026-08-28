@@ -1,0 +1,33 @@
+{
+  "_comment": "Charles 的情报源清单。type: rss=标准 RSS/Atom（curl 直接解析）；web=公告/资讯页（需 WebFetch 阅读）。新增源只需追加条目；临时停用把 enabled 改为 false，不要删除（保留审计线索）。所有源必须无需登录凭据，涉及 API Key 的源（如 X/Twitter）留给后续显式配置。",
+  "sources": [
+    {
+      "name": "coindesk",
+      "type": "rss",
+      "url": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+      "tags": ["宏观", "行业", "btc"],
+      "enabled": true
+    },
+    {
+      "name": "cointelegraph",
+      "type": "rss",
+      "url": "https://cointelegraph.com/rss",
+      "tags": ["行业", "altcoin"],
+      "enabled": true
+    },
+    {
+      "name": "theblock",
+      "type": "rss",
+      "url": "https://www.theblock.co/rss.xml",
+      "tags": ["行业", "监管"],
+      "enabled": true
+    },
+    {
+      "name": "okx-announcements",
+      "type": "web",
+      "url": "https://www.okx.com/announcements",
+      "tags": ["交易所公告", "okx"],
+      "enabled": true
+    }
+  ]
+}

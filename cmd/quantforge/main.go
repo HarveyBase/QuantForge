@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -66,6 +67,8 @@ func cfgPath(fs *flag.FlagSet) string {
 
 // app 共享装配。
 type app struct {
+	mu   sync.RWMutex
+	btMu sync.Mutex
 	cfg  *config.Config
 	ex   exchange.Exchange
 	pf   *portfolio.Portfolio
@@ -91,23 +94,33 @@ func buildApp(cfg *config.Config) (*app, error) {
 	var ex exchange.Exchange
 	switch cfg.Mode {
 	case config.ModePaper:
-		ex = okx.NewPaper(cfg.Exchange.TdMode, cfg.Exchange.Leverage)
+		ex = okx.NewPaperWithURL(cfg.Exchange.RestURL, cfg.Exchange.TdMode, cfg.Exchange.Leverage)
 	case config.ModeLive:
-		ex = okx.NewLive(cfg.Exchange.TdMode, cfg.Exchange.Leverage)
+		ex = okx.NewLiveWithURL(cfg.Exchange.RestURL, cfg.Exchange.TdMode, cfg.Exchange.Leverage)
 	default:
-		ex = okx.NewPublic()
+		ex = okx.NewPublicWithURL(cfg.Exchange.RestURL)
 	}
 	pf := portfolio.New(0)
 	rkLimits := risk.Limits{
-		MaxOrderNotionalUSD: cfg.Risk.MaxOrderNotionalUSD,
-		MaxDailyNotionalUSD: cfg.Risk.MaxDailyNotionalUSD,
+		MaxOrderNotionalUSD:    cfg.Risk.MaxOrderNotionalUSD,
+		MaxDailyNotionalUSD:    cfg.Risk.MaxDailyNotionalUSD,
 		MaxPositionNotionalUSD: cfg.Risk.MaxPositionNotionalUSD,
-		MaxOrdersPerMinute: cfg.Risk.MaxOrdersPerMinute,
-		MaxDailyLossPct: cfg.Risk.MaxDailyLossPct,
+		MaxOrdersPerMinute:     cfg.Risk.MaxOrdersPerMinute,
+		MaxDailyLossPct:        cfg.Risk.MaxDailyLossPct,
 		CooldownAfterRejectSec: cfg.Risk.CooldownAfterRejectSec,
 	}
-	os.MkdirAll(filepath.Join(cfg.DataDir, "logs"), 0o755)
+	// 启动时先同步现货账户，失败则不进入交易流程。
+	if cfg.Mode != config.ModeResearch {
+		balances, err := ex.GetBalances(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("账户初始化失败: %w", err)
+		}
+		pf.Seed(balances, cfg.Exchange.InstID, strings.Split(cfg.Exchange.InstID, "-")[0], "USDT", 0)
+	}
 	rk := risk.NewManager(rkLimits, pf, filepath.Join(cfg.DataDir, "logs", "rejections.jsonl"))
+	if cfg.Mode != config.ModeResearch {
+		rk.SetDayStartEquity(pf.Equity())
+	}
 	g, err := grid.New(grid.Params{
 		Lower: cfg.Strategy.Grid.Lower, Upper: cfg.Strategy.Grid.Upper,
 		Grids: cfg.Strategy.Grid.Grids, QtyPerGrid: cfg.Strategy.Grid.QtyPerGrid,
@@ -119,7 +132,7 @@ func buildApp(cfg *config.Config) (*app, error) {
 	a := &app{
 		cfg: cfg, ex: ex, pf: pf, rk: rk, grid: g,
 		snap: market.NewSnapshotStore(cfg.DataDir),
-		pol: &market.Poller{Ex: ex, Symbol: cfg.Exchange.InstID, Interval: cfg.Trading.Interval},
+		pol:  &market.Poller{Ex: ex, Symbol: cfg.Exchange.InstID, Interval: cfg.Trading.Interval},
 	}
 	// paper/live 才有执行器；research 用空执行器（后台展示零订单）
 	if cfg.Mode != config.ModeResearch {
@@ -128,22 +141,34 @@ func buildApp(cfg *config.Config) (*app, error) {
 				a.grid.ApplyFill(ev.Order.Side, ev.Order.FilledQty, ev.Order.AvgPrice)
 			}
 		})
+		rk.Kill.OnTrip(func(reason string) {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				a.exec.CancelAll(ctx, cfg.Exchange.InstID)
+			}()
+		})
 	}
 	return a, nil
 }
 
 // onCandles 数据更新回调：更新标记价 + 驱动策略（只在新收盘根上）。
 func (a *app) onCandles(candles []exchange.Candle) {
-	a.candles = candles
+	a.mu.Lock()
+	a.candles = append([]exchange.Candle(nil), candles...)
+	a.mu.Unlock()
 	if len(candles) == 0 {
 		return
 	}
 	last := candles[len(candles)-1]
-	a.pf.UpdateMark(a.cfg.Exchange.InstID, last.Close)
+	a.mu.Lock()
 	if last.OpenTime == a.lastCandle || len(candles) < a.grid.Warmup() {
+		a.mu.Unlock()
 		return
 	}
 	a.lastCandle = last.OpenTime
+	a.mu.Unlock()
+	a.pf.UpdateMark(a.cfg.Exchange.InstID, last.Close)
 	// 快照留痕（每次新收盘根固化一次）
 	if _, err := a.snap.Save(snapshotName(a.cfg), candles); err != nil {
 		log.Printf("snapshot 保存失败: %v", err)
@@ -162,11 +187,11 @@ func (a *app) onCandles(candles []exchange.Candle) {
 		Symbol: a.cfg.Exchange.InstID, Interval: a.cfg.Trading.Interval,
 		Candles: candles, Equity: a.pf.Equity(), Position: posQty, Cash: cash,
 	}
-	for _, intent := range a.grid.OnCandle(sctx) {
+	for intentIndex, intent := range a.grid.OnCandle(sctx) {
 		req := exchange.OrderRequest{
 			Symbol: a.cfg.Exchange.InstID, Side: intent.Side, Type: intent.Type,
 			Price: intent.Price, Qty: intent.Qty,
-			ClientOrderID: fmt.Sprintf("qf-%d-%s", last.OpenTime, intent.Kind),
+			ClientOrderID: fmt.Sprintf("qf-%d-%s-%d", last.OpenTime, intent.Kind, intentIndex),
 		}
 		if _, err := a.exec.Submit(context.Background(), req); err != nil {
 			log.Printf("下单失败 [%s]: %v", intent.Kind, err) // 拒单留痕，不静默
@@ -193,7 +218,9 @@ func (a *app) loadFixedSample() error {
 	if err != nil {
 		return err
 	}
+	a.mu.Lock()
 	a.candles = clean
+	a.mu.Unlock()
 	return nil
 }
 
@@ -242,7 +269,11 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 	if a.exec != nil {
 		orderSrc = a.exec
 	}
-	srv := dashboard.New(cfg, a.pf, a.rk, orderSrc, a.grid, func() []exchange.Candle { return a.candles }, runBacktest)
+	srv := dashboard.New(cfg, a.pf, a.rk, orderSrc, a.grid, func() []exchange.Candle {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		return append([]exchange.Candle(nil), a.candles...)
+	}, runBacktest)
 
 	if !cfg.Dashboard.Enabled {
 		log.Printf("mode=%s symbol=%s（后台未启用）", cfg.Mode, cfg.Exchange.InstID)
@@ -267,26 +298,45 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 // runBacktest 用当前缓存的 K 线跑回测（试验计数累计，防数据窥探）。
 // 数据降级顺序（docs/02 完整性优先）：缓存 → 实时拉取 → 快照 → 固定样本。
 func (a *app) runBacktest(ctx context.Context) (*backtest.Result, error) {
-	if len(a.candles) < 30 {
-		if _, err := a.pol.FetchOnce(ctx, 300); err != nil {
+	a.btMu.Lock()
+	defer a.btMu.Unlock()
+	a.mu.RLock()
+	candles := append([]exchange.Candle(nil), a.candles...)
+	a.mu.RUnlock()
+	if len(candles) < 30 {
+		cs, err := a.ex.GetCandles(ctx, a.cfg.Exchange.InstID, a.cfg.Trading.Interval, 300)
+		if err == nil {
+			cs, err = market.Validate(cs, market.IntervalMs(a.cfg.Trading.Interval))
+		}
+		if err == nil {
+			candles = cs
+		} else {
 			log.Printf("实时拉取失败，降级快照: %v", err)
 		}
 	}
-	if len(a.candles) < 30 {
+	if len(candles) < 30 {
 		if cs, err := a.snap.LoadLatest(snapshotName(a.cfg)); err == nil {
-			a.candles = cs
+			candles = cs
 		}
 	}
-	if len(a.candles) < 30 {
+	if len(candles) < 30 {
 		if err := a.loadFixedSample(); err != nil {
 			return nil, fmt.Errorf("行情不足且所有数据层失败: %w", err)
 		}
 		log.Printf("使用固定样本层 data/samples/（离线口径，结果仅用于演示）")
 	}
-	if len(a.candles) < 30 {
-		return nil, fmt.Errorf("K 线不足（%d 根，至少 30）", len(a.candles))
+	a.mu.RLock()
+	if len(candles) < 30 {
+		candles = append([]exchange.Candle(nil), a.candles...)
 	}
+	a.mu.RUnlock()
+	if len(candles) < 30 {
+		return nil, fmt.Errorf("K 线不足（%d 根，至少 30）", len(candles))
+	}
+	a.mu.Lock()
 	a.trials++
+	trials := a.trials
+	a.mu.Unlock()
 	g, err := grid.New(grid.Params{
 		Lower: a.cfg.Strategy.Grid.Lower, Upper: a.cfg.Strategy.Grid.Upper,
 		Grids: a.cfg.Strategy.Grid.Grids, QtyPerGrid: a.cfg.Strategy.Grid.QtyPerGrid,
@@ -297,10 +347,10 @@ func (a *app) runBacktest(ctx context.Context) (*backtest.Result, error) {
 	}
 	eng := &backtest.Engine{
 		Strategy: g,
-		Cost: backtest.CostModel{SlippageBps: a.cfg.Trading.SlippageBps, MakerFeeBps: 2, TakerFeeBps: 5},
+		Cost:     backtest.CostModel{SlippageBps: a.cfg.Trading.SlippageBps, MakerFeeBps: 2, TakerFeeBps: 5},
 		SeedCash: 10000,
 	}
-	res, err := eng.Run(a.candles, a.cfg.Exchange.InstID, a.cfg.Trading.Interval, a.trials)
+	res, err := eng.Run(candles, a.cfg.Exchange.InstID, a.cfg.Trading.Interval, trials)
 	if err != nil {
 		return nil, err
 	}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api } from './api'
+import { api, streamURL } from './api'
 import type { BacktestResult, Candle, GridStats, Order, Rejection } from './types'
 
 const fmt = (v: number, digits = 2) =>
@@ -50,7 +50,7 @@ export default function App() {
 
   // SSE 事件流（自动重连由浏览器完成）
   useEffect(() => {
-    const es = new EventSource('/api/stream')
+    const es = new EventSource(streamURL())
     es.addEventListener('update', (e) => {
       const msg = JSON.parse((e as MessageEvent).data)
       setFlash(`${new Date(msg.ts).toLocaleTimeString()} ${msg.kind}`)

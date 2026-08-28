@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/HarveyBase/QuantForge/exchange"
@@ -15,6 +16,7 @@ import (
 // 追溯链：报告结论 → 数据集名称 → 当前指针 → history_id 归档 → manifest。
 type SnapshotStore struct {
 	root string // data/snapshots
+	mu   sync.Mutex
 }
 
 func NewSnapshotStore(dataDir string) *SnapshotStore {
@@ -23,6 +25,8 @@ func NewSnapshotStore(dataDir string) *SnapshotStore {
 
 // Save 写入一份 K 线快照：data/snapshots/<name>/<ts>.json + latest.json 指针 + manifest.json。
 func (s *SnapshotStore) Save(name string, candles []exchange.Candle) (historyID string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	dir := filepath.Join(s.root, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("snapshot: 建目录失败: %w", err)
@@ -30,10 +34,10 @@ func (s *SnapshotStore) Save(name string, candles []exchange.Candle) (historyID 
 	historyID = time.Now().UTC().Format("20060102T150405.000000000")
 	archive := filepath.Join(dir, historyID+".json")
 	payload := struct {
-		HistoryID string             `json:"history_id"`
-		SavedAt   time.Time          `json:"saved_at"`
-		Count     int                `json:"count"`
-		Candles   []exchange.Candle  `json:"candles"`
+		HistoryID string            `json:"history_id"`
+		SavedAt   time.Time         `json:"saved_at"`
+		Count     int               `json:"count"`
+		Candles   []exchange.Candle `json:"candles"`
 	}{historyID, time.Now().UTC(), len(candles), candles}
 	b, err := json.MarshalIndent(payload, "", " ")
 	if err != nil {
@@ -98,10 +102,12 @@ func (s *SnapshotStore) updateManifest(dir, historyID string, count int) error {
 
 // Poller 周期拉取并校验 K 线，产出"已确认序列"供策略与回测使用。
 type Poller struct {
-	Ex        exchange.Exchange
-	Symbol    string
-	Interval  string
-	OnUpdate  func([]exchange.Candle) // 每次成功拉取校验后的回调
+	Ex       exchange.Exchange
+	Symbol   string
+	Interval string
+	OnUpdate func([]exchange.Candle) // 每次成功拉取校验后的回调
+	OnError  func(error)             // 拉取或校验失败回调
+	mu       sync.Mutex
 }
 
 // FetchOnce 拉一次 → 校验 → 回调。
@@ -134,7 +140,10 @@ func (p *Poller) Run(ctx context.Context, limit int, every time.Duration) {
 			return
 		case <-ticker.C:
 			if _, err := p.FetchOnce(ctx, limit); err != nil {
-				continue // 拉取失败下轮重试；错误已在日志层留痕
+				if p.OnError != nil {
+					p.OnError(err)
+				}
+				continue
 			}
 		}
 	}

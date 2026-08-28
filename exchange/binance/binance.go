@@ -42,6 +42,10 @@ func (c *Client) GetOrder(ctx context.Context, symbol, orderID string) (exchange
 	return exchange.Order{}, exchange.ErrNotImplemented
 }
 
+func (c *Client) GetOrderByClientID(ctx context.Context, symbol, clientOrderID string) (exchange.Order, error) {
+	return exchange.Order{}, exchange.ErrNotImplemented
+}
+
 func (c *Client) GetOpenOrders(ctx context.Context, symbol string) ([]exchange.Order, error) {
 	return nil, exchange.ErrNotImplemented
 }

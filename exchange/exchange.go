@@ -93,11 +93,11 @@ func (c Candle) Key() string {
 
 // Ticker 最新成交与盘口。
 type Ticker struct {
-	Symbol   string  `json:"symbol"`
-	Last     float64 `json:"last"`
-	Bid      float64 `json:"bid"`
-	Ask      float64 `json:"ask"`
-	Ts       int64   `json:"ts"`
+	Symbol string  `json:"symbol"`
+	Last   float64 `json:"last"`
+	Bid    float64 `json:"bid"`
+	Ask    float64 `json:"ask"`
+	Ts     int64   `json:"ts"`
 }
 
 // Mid 盘口中间价。
@@ -121,28 +121,28 @@ type OrderRequest struct {
 	Symbol        string    `json:"symbol"`
 	Side          Side      `json:"side"`
 	Type          OrderType `json:"type"`
-	Price         float64   `json:"price"` // limit 必填
-	Qty           float64   `json:"qty"`   // Base 数量（适配器内部换算张数）
+	Price         float64   `json:"price"`           // limit 必填
+	Qty           float64   `json:"qty"`             // Base 数量（适配器内部换算张数）
 	ClientOrderID string    `json:"client_order_id"` // 幂等键
 }
 
 // Order 订单（含成交回报）。
 type Order struct {
-	Exchange     string      `json:"exchange"`
-	Symbol       string      `json:"symbol"`
-	OrderID      string      `json:"order_id"`
-	ClientOrderID string     `json:"client_order_id"`
-	Side         Side        `json:"side"`
-	Type         OrderType   `json:"type"`
-	Price        float64     `json:"price"`
-	Qty          float64     `json:"qty"`       // 委托数量（Base）
-	FilledQty    float64     `json:"filled_qty"` // 已成交数量（Base）
-	AvgPrice     float64     `json:"avg_price"`
-	Fee          float64     `json:"fee"`     // 累计手续费（带符号，负=已支付）
-	FeeCcy       string      `json:"fee_ccy"`
-	Status       OrderStatus `json:"status"`
-	CreatedAt    int64       `json:"created_at"`
-	UpdatedAt    int64       `json:"updated_at"`
+	Exchange      string      `json:"exchange"`
+	Symbol        string      `json:"symbol"`
+	OrderID       string      `json:"order_id"`
+	ClientOrderID string      `json:"client_order_id"`
+	Side          Side        `json:"side"`
+	Type          OrderType   `json:"type"`
+	Price         float64     `json:"price"`
+	Qty           float64     `json:"qty"`        // 委托数量（Base）
+	FilledQty     float64     `json:"filled_qty"` // 已成交数量（Base）
+	AvgPrice      float64     `json:"avg_price"`
+	Fee           float64     `json:"fee"` // 累计手续费（带符号，负=已支付）
+	FeeCcy        string      `json:"fee_ccy"`
+	Status        OrderStatus `json:"status"`
+	CreatedAt     int64       `json:"created_at"`
+	UpdatedAt     int64       `json:"updated_at"`
 }
 
 // Notional 委打名义价值（按委托价估算，市价单用 AvgPrice）。
@@ -154,10 +154,22 @@ func (o Order) Notional() float64 {
 	return p * o.Qty
 }
 
+// Fill 单笔增量成交。Price/Fee 均为本次增量口径，不是订单累计值。
+type Fill struct {
+	Symbol        string  `json:"symbol"`
+	ClientOrderID string  `json:"client_order_id"`
+	Side          Side    `json:"side"`
+	Qty           float64 `json:"qty"`
+	Price         float64 `json:"price"`
+	Fee           float64 `json:"fee"` // 带符号，负=已支付
+	FeeCcy        string  `json:"fee_ccy"`
+	Ts            int64   `json:"ts"`
+}
+
 // Balance 资产余额。
 type Balance struct {
-	Asset    string  `json:"asset"`
-	Total    float64 `json:"total"`
+	Asset     string  `json:"asset"`
+	Total     float64 `json:"total"`
 	Available float64 `json:"available"` // 可用（冻结剔除），卖出校验用它
 }
 
@@ -176,5 +188,6 @@ type Exchange interface {
 	PlaceOrder(ctx context.Context, req OrderRequest) (Order, error)
 	CancelOrder(ctx context.Context, symbol, orderID string) error
 	GetOrder(ctx context.Context, symbol, orderID string) (Order, error)
+	GetOrderByClientID(ctx context.Context, symbol, clientOrderID string) (Order, error)
 	GetOpenOrders(ctx context.Context, symbol string) ([]Order, error)
 }

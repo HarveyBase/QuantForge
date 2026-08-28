@@ -17,50 +17,67 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HarveyBase/QuantForge/exchange"
 )
 
 const (
-	defaultBaseURL   = "https://www.okx.com"
-	envAPIKey        = "OKX_API_KEY"
-	envSecret        = "OKX_SECRET"
-	envPassphrase    = "OKX_PASSPHRASE"
-	demoHeader       = "x-simulated-trading"
-	credMissingHint  = "OKX 交易接口需要 API Key（环境变量 %s/%s/%s；paper 模式请用 OKX 演示环境的 Key）"
+	defaultBaseURL  = "https://www.okx.com"
+	envAPIKey       = "OKX_API_KEY"
+	envSecret       = "OKX_SECRET"
+	envPassphrase   = "OKX_PASSPHRASE"
+	demoHeader      = "x-simulated-trading"
+	credMissingHint = "OKX 交易接口需要 API Key（环境变量 %s/%s/%s；paper 模式请用 OKX 演示环境的 Key）"
 )
 
 // Client OKX REST 客户端。
 type Client struct {
-	BaseURL   string
-	APIKey    string
-	Secret    string
+	BaseURL    string
+	APIKey     string
+	Secret     string
 	Passphrase string
-	Simulated bool // true = demo trading（paper 模式）
-	HTTP      *http.Client
-	TdMode    string // 合约全仓 cross / 逐仓 isolated；现货固定 cash
-	Leverage  float64
+	Simulated  bool // true = demo trading（paper 模式）
+	HTTP       *http.Client
+	TdMode     string // 合约全仓 cross / 逐仓 isolated；现货固定 cash
+	Leverage   float64
+	cacheMu    sync.Mutex
+	contracts  map[string]float64
 }
 
 // NewLive 生产环境客户端，Key 从环境变量读取。
 func NewLive(tdMode string, leverage float64) *Client {
+	return NewLiveWithURL(defaultBaseURL, tdMode, leverage)
+}
+
+func NewLiveWithURL(baseURL, tdMode string, leverage float64) *Client {
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = defaultBaseURL
+	}
 	return &Client{
-		BaseURL: defaultBaseURL, TdMode: tdMode, Leverage: leverage,
+		BaseURL: strings.TrimRight(baseURL, "/"), TdMode: tdMode, Leverage: leverage,
 		APIKey: os.Getenv(envAPIKey), Secret: os.Getenv(envSecret), Passphrase: os.Getenv(envPassphrase),
-		HTTP: &http.Client{Timeout: 15 * time.Second},
+		HTTP: &http.Client{Timeout: 15 * time.Second}, contracts: map[string]float64{},
 	}
 }
 
 // NewPaper 演示环境（demo trading）客户端：与实盘同一套代码，仅多一个模拟头。
 func NewPaper(tdMode string, leverage float64) *Client {
-	c := NewLive(tdMode, leverage)
+	return NewPaperWithURL(defaultBaseURL, tdMode, leverage)
+}
+
+func NewPaperWithURL(baseURL, tdMode string, leverage float64) *Client {
+	c := NewLiveWithURL(baseURL, tdMode, leverage)
 	c.Simulated = true
 	return c
 }
 
-// NewPublic 仅公开行情（无 Key 也能跑 research/paper 数据面）。
-func NewPublic() *Client { return NewLive("cross", 1) }
+// NewPublic 仅公开行情（无 Key 也能跑 research 数据面）。
+func NewPublic() *Client                      { return NewPublicWithURL(defaultBaseURL) }
+func NewPublicWithURL(baseURL string) *Client { return NewLiveWithURL(baseURL, "cross", 1) }
+
+func (c *Client) HasCredentials() bool { return c.hasCreds() }
 
 func (c *Client) Name() string { return "okx" }
 
@@ -225,15 +242,15 @@ func (c *Client) GetInstrument(ctx context.Context, instID string) (exchange.Ins
 	}
 	var env struct {
 		Data []struct {
-			InstID  string `json:"instId"`
-			CtVal   string `json:"ctVal"`
-			LotSz   string `json:"lotSz"`
-			MinSz   string `json:"minSz"`
-			TickSz  string `json:"tickSz"`
-			Settle  string `json:"settleCcy"`
-			BaseCcy string `json:"baseCcy"`
+			InstID   string `json:"instId"`
+			CtVal    string `json:"ctVal"`
+			LotSz    string `json:"lotSz"`
+			MinSz    string `json:"minSz"`
+			TickSz   string `json:"tickSz"`
+			Settle   string `json:"settleCcy"`
+			BaseCcy  string `json:"baseCcy"`
 			QuoteCcy string `json:"quoteCcy"`
-			CtType  string `json:"ctType"`
+			CtType   string `json:"ctType"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &env); err != nil || len(env.Data) == 0 {
@@ -307,7 +324,7 @@ func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (exc
 		if ins.ContractSize <= 0 {
 			return exchange.Order{}, fmt.Errorf("okx: 合约面值非法 %v", ins.ContractSize)
 		}
-		sz = mathFloor(req.Qty/ins.ContractSize)
+		sz = mathFloor(req.Qty / ins.ContractSize)
 		if sz < 1 {
 			return exchange.Order{}, fmt.Errorf("okx: 数量 %v 不足 1 张合约（面值 %v）", req.Qty, ins.ContractSize)
 		}
@@ -335,10 +352,10 @@ func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (exc
 	}
 	var env struct {
 		Data []struct {
-			OrdID  string `json:"ordId"`
+			OrdID   string `json:"ordId"`
 			ClOrdID string `json:"clOrdID"`
-			SCode  string `json:"sCode"`
-			SMsg   string `json:"sMsg"`
+			SCode   string `json:"sCode"`
+			SMsg    string `json:"sMsg"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &env); err != nil || len(env.Data) == 0 {
@@ -376,6 +393,24 @@ func (c *Client) GetOrder(ctx context.Context, symbol, orderID string) (exchange
 	return c.convert(env.Data[0]), nil
 }
 
+func (c *Client) GetOrderByClientID(ctx context.Context, symbol, clientOrderID string) (exchange.Order, error) {
+	data, err := c.do(ctx, http.MethodGet, "/api/v5/trade/order",
+		url.Values{"instId": {symbol}, "clOrdId": {clientOrderID}}, nil, true)
+	if err != nil {
+		return exchange.Order{}, err
+	}
+	var env struct {
+		Data []okxOrder `json:"data"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		return exchange.Order{}, fmt.Errorf("okx: 解析订单失败: %w", err)
+	}
+	if len(env.Data) == 0 {
+		return exchange.Order{}, fmt.Errorf("okx: 按 clientOrderID %s 查询订单为空", clientOrderID)
+	}
+	return c.convert(env.Data[0]), nil
+}
+
 func (c *Client) GetOpenOrders(ctx context.Context, symbol string) ([]exchange.Order, error) {
 	instType := "SPOT"
 	if strings.HasSuffix(symbol, "-SWAP") {
@@ -407,7 +442,7 @@ type okxOrder struct {
 	Side      string `json:"side"`
 	OrdType   string `json:"ordType"`
 	Px        string `json:"px"`
-	Sz        string `json:"sz"`       // 委托数量（现货=Base，合约=张）
+	Sz        string `json:"sz"` // 委托数量（现货=Base，合约=张）
 	AccFillSz string `json:"accFillSz"`
 	AvgPx     string `json:"avgPx"`
 	Fee       string `json:"fee"`
@@ -446,21 +481,26 @@ func (c *Client) convert(o okxOrder) exchange.Order {
 	}
 }
 
-// instrumentCache 合约面值缓存（GetOrder 高频调用，避免每次拉规格）。
-var instrumentCache = map[string]float64{}
-
+// contractSizeOf 使用客户端级缓存，避免跨客户端污染和并发 map 竞态。
 func (c *Client) contractSizeOf(instID string) float64 {
-	if v, ok := instrumentCache[instID]; ok {
+	c.cacheMu.Lock()
+	if c.contracts == nil {
+		c.contracts = map[string]float64{}
+	}
+	if v, ok := c.contracts[instID]; ok {
+		c.cacheMu.Unlock()
 		return v
 	}
+	c.cacheMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ins, err := c.GetInstrument(ctx, instID)
 	if err != nil || ins.ContractSize == 0 {
-		// 拉不到时假定线性合约面值未知，按原值返回（数量字段保持张口径并在上层容错）
 		return 0
 	}
-	instrumentCache[instID] = ins.ContractSize
+	c.cacheMu.Lock()
+	c.contracts[instID] = ins.ContractSize
+	c.cacheMu.Unlock()
 	return ins.ContractSize
 }
 

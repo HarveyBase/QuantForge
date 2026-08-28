@@ -46,7 +46,9 @@ func TestDownCrossBuysUpCrossSells(t *testing.T) {
 	if gots[0].Price != 125 { // 在下一档（idx=1 的下一档是 levels[0]? 不，buyIntent(level=2)→levels[1]=125
 		t.Fatalf("买单价应为 125: %v", gots[0].Price)
 	}
-	sells := g.OnCandle(ctxAt(160))
+	up := ctxAt(160)
+	up.Position = 0.1
+	sells := g.OnCandle(up)
 	if len(sells) == 0 || sells[0].Side != exchange.Sell {
 		t.Fatalf("上穿应产生卖单: %+v", sells)
 	}

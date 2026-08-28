@@ -5,8 +5,11 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
+
+	"github.com/HarveyBase/QuantForge/market"
 )
 
 // Mode 交易阶段分级：research(回测) / paper(模拟盘) / live(实盘)。
@@ -26,49 +29,49 @@ const LiveGateEnv = "QUANTFORGE_ALLOW_LIVE"
 const LiveGateValue = "I_UNDERSTAND_THE_RISK"
 
 type Config struct {
-	Mode      Mode             `json:"mode"`
-	Exchange  ExchangeConfig   `json:"exchange"`
-	Trading   TradingConfig    `json:"trading"`
-	Risk      RiskConfig       `json:"risk"`
-	Strategy  StrategyConfig   `json:"strategy"`
-	Dashboard DashboardConfig  `json:"dashboard"`
-	DataDir   string           `json:"data_dir"`
+	Mode      Mode            `json:"mode"`
+	Exchange  ExchangeConfig  `json:"exchange"`
+	Trading   TradingConfig   `json:"trading"`
+	Risk      RiskConfig      `json:"risk"`
+	Strategy  StrategyConfig  `json:"strategy"`
+	Dashboard DashboardConfig `json:"dashboard"`
+	DataDir   string          `json:"data_dir"`
 }
 
 type ExchangeConfig struct {
-	Name     string  `json:"name"`        // 交易所：okx（binance 二期）
-	Market   string  `json:"market"`      // SPOT | SWAP
-	InstID   string  `json:"inst_id"`     // 如 BTC-USDT / BTC-USDT-SWAP
-	RestURL  string  `json:"rest_url"`    // 默认 https://www.okx.com
-	TdMode   string  `json:"td_mode"`     // 合约下单模式：cross | isolated；现货固定 cash
-	Leverage float64 `json:"leverage"`    // 合约杠杆，现货忽略
+	Name     string  `json:"name"`     // 交易所：okx（binance 二期）
+	Market   string  `json:"market"`   // SPOT | SWAP
+	InstID   string  `json:"inst_id"`  // 如 BTC-USDT / BTC-USDT-SWAP
+	RestURL  string  `json:"rest_url"` // 默认 https://www.okx.com
+	TdMode   string  `json:"td_mode"`  // 合约下单模式：cross | isolated；现货固定 cash
+	Leverage float64 `json:"leverage"` // 合约杠杆，现货忽略
 }
 
 type TradingConfig struct {
-	Interval      string  `json:"interval"`       // K线周期：1m/5m/15m/30m/1H/4H/1D
-	SlippageBps   float64 `json:"slippage_bps"`   // 回测/模拟撮合滑点（基点）
+	Interval    string  `json:"interval"`     // K线周期：1m/5m/15m/30m/1H/4H/1D
+	SlippageBps float64 `json:"slippage_bps"` // 回测/模拟撮合滑点（基点）
 }
 
 type RiskConfig struct {
-	MaxOrderNotionalUSD     float64 `json:"max_order_notional_usd"`
-	MaxDailyNotionalUSD     float64 `json:"max_daily_notional_usd"`
-	MaxPositionNotionalUSD  float64 `json:"max_position_notional_usd"`
-	MaxOrdersPerMinute      int     `json:"max_orders_per_minute"`
-	MaxDailyLossPct         float64 `json:"max_daily_loss_pct"`
-	CooldownAfterRejectSec  int     `json:"cooldown_after_reject_sec"`
+	MaxOrderNotionalUSD    float64 `json:"max_order_notional_usd"`
+	MaxDailyNotionalUSD    float64 `json:"max_daily_notional_usd"`
+	MaxPositionNotionalUSD float64 `json:"max_position_notional_usd"`
+	MaxOrdersPerMinute     int     `json:"max_orders_per_minute"`
+	MaxDailyLossPct        float64 `json:"max_daily_loss_pct"`
+	CooldownAfterRejectSec int     `json:"cooldown_after_reject_sec"`
 }
 
 type StrategyConfig struct {
-	Name string    `json:"name"` // grid
+	Name string     `json:"name"` // grid
 	Grid GridConfig `json:"grid"`
 }
 
 type GridConfig struct {
-	Lower       float64 `json:"lower"`        // 网格下界
-	Upper       float64 `json:"upper"`        // 网格上界
-	Grids       int     `json:"grids"`        // 格数（≥2）
-	QtyPerGrid  float64 `json:"qty_per_grid"` // 每格数量（币本位）
-	Spacing     string  `json:"spacing"`      // arith(等差) | geo(等比)
+	Lower       float64 `json:"lower"`         // 网格下界
+	Upper       float64 `json:"upper"`         // 网格上界
+	Grids       int     `json:"grids"`         // 格数（≥2）
+	QtyPerGrid  float64 `json:"qty_per_grid"`  // 每格数量（币本位）
+	Spacing     string  `json:"spacing"`       // arith(等差) | geo(等比)
 	StopOnBreak bool    `json:"stop_on_break"` // 下界打穿停止补格并告警
 }
 
@@ -89,7 +92,7 @@ func Default() *Config {
 			RestURL: "https://www.okx.com",
 			TdMode:  "cross",
 		},
-		Trading:  TradingConfig{Interval: "1H", SlippageBps: 5},
+		Trading: TradingConfig{Interval: "1H", SlippageBps: 5},
 		Risk: RiskConfig{
 			MaxOrderNotionalUSD:    1000,
 			MaxDailyNotionalUSD:    10000,
@@ -150,6 +153,22 @@ func (c *Config) Validate() error {
 	if c.Exchange.InstID == "" {
 		return fmt.Errorf("config: exchange.inst_id 不能为空")
 	}
+	if c.Exchange.RestURL == "" {
+		return fmt.Errorf("config: exchange.rest_url 不能为空")
+	}
+	u, err := url.Parse(c.Exchange.RestURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("config: exchange.rest_url 必须是合法 HTTPS 地址")
+	}
+	if c.Mode != ModeResearch && c.Exchange.Market == "SWAP" {
+		return fmt.Errorf("config: SWAP 永续当前仅支持 research，paper/live 为安全禁用")
+	}
+	if c.Trading.SlippageBps < 0 || c.Trading.SlippageBps > 1000 {
+		return fmt.Errorf("config: trading.slippage_bps 必须在 [0,1000]")
+	}
+	if market.IntervalMs(c.Trading.Interval) == 0 {
+		return fmt.Errorf("config: trading.interval 不支持 %q", c.Trading.Interval)
+	}
 	if c.Exchange.Market == "SWAP" {
 		if c.Exchange.Leverage < 1 || c.Exchange.Leverage > 10 {
 			return fmt.Errorf("config: 杠杆必须在 [1,10]（风险纪律：禁高杠杆），当前 %v", c.Exchange.Leverage)
@@ -164,8 +183,11 @@ func (c *Config) Validate() error {
 		c.Risk.MaxPositionNotionalUSD <= 0 || c.Risk.MaxOrdersPerMinute <= 0 {
 		return fmt.Errorf("config: risk 限额必须全部为正（风控前置，不允许无限制下单）")
 	}
-	if c.Risk.MaxOrderNotionalUSD > c.Risk.MaxDailyNotionalUSD {
-		return fmt.Errorf("config: 单笔限额不能大于单日限额")
+	if c.Risk.MaxDailyLossPct <= 0 || c.Risk.MaxDailyLossPct > 100 {
+		return fmt.Errorf("config: risk.max_daily_loss_pct 必须在 (0,100]")
+	}
+	if c.Risk.CooldownAfterRejectSec < 0 {
+		return fmt.Errorf("config: cooldown_after_reject_sec 不能为负")
 	}
 	g := c.Strategy.Grid
 	if c.Strategy.Name == "grid" {
@@ -185,6 +207,13 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c *Config) Sanitized() *Config {
+	copyCfg := *c
+	copyCfg.Dashboard = c.Dashboard
+	copyCfg.Dashboard.Token = ""
+	return &copyCfg
 }
 
 // CheckLiveGate 实盘门禁：mode=live 时必须显式设置确认环境变量。

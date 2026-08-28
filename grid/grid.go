@@ -5,6 +5,7 @@ package grid
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/HarveyBase/QuantForge/exchange"
 	"github.com/HarveyBase/QuantForge/strategy"
@@ -24,6 +25,7 @@ type Params struct {
 
 // Grid 现货网格（Base-Quote 计价，首期以 BTC-USDT 口径实现）。
 type Grid struct {
+	mu        sync.RWMutex
 	params    Params
 	levels    []float64 // 网格价格线
 	baseQty   float64   // 当前持仓（Base）
@@ -31,8 +33,8 @@ type Grid struct {
 	lastIdx   int       // 上次所处的格序号
 	broke     bool      // 已跌破下界（打穿）
 	started   bool
-	rounds    int       // 完成的网格轮数（低买高卖一对算一轮）
-	realized  float64   // 已实现利润
+	rounds    int     // 完成的网格轮数（低买高卖一对算一轮）
+	realized  float64 // 已实现利润
 }
 
 func New(p Params) (*Grid, error) {
@@ -56,11 +58,15 @@ func New(p Params) (*Grid, error) {
 	return g, nil
 }
 
-func (g *Grid) Name() string  { return "grid" }
-func (g *Grid) Warmup() int   { return 1 }
+func (g *Grid) Name() string { return "grid" }
+func (g *Grid) Warmup() int  { return 1 }
 
 // Levels 网格线（展示用）。
-func (g *Grid) Levels() []float64 { return g.levels }
+func (g *Grid) Levels() []float64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return append([]float64(nil), g.levels...)
+}
 
 // index 价格所处的格序号（0 = 下界之下）。
 func (g *Grid) index(price float64) int {
@@ -75,6 +81,8 @@ func (g *Grid) index(price float64) int {
 // OnCandle 每根收盘 K 线：跨格移动时产出逐格成交意图（经风控与执行器落地）。
 // 向下穿格 → 在下一档挂买单；向上穿格 → 在上一档挂卖单；打穿下界后停止补格。
 func (g *Grid) OnCandle(ctx *strategy.Context) []strategy.OrderIntent {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if len(ctx.Candles) == 0 {
 		return nil
 	}
@@ -100,9 +108,14 @@ func (g *Grid) OnCandle(ctx *strategy.Context) []strategy.OrderIntent {
 		}
 		out = append(out, g.buyIntent(i, fmt.Sprintf("下穿第 %d 格", i)))
 	}
-	// 向上跨格：逐格卖出
+	// 向上跨格：只为真实持仓生成卖单，避免未成交买单对应的幽灵卖出。
+	availableQty := ctx.Position
 	for i := g.lastIdx + 1; i <= idx && i <= len(g.levels)-1; i++ {
+		if availableQty+1e-12 < g.params.QtyPerGrid {
+			break
+		}
 		out = append(out, g.sellIntent(i, fmt.Sprintf("上穿第 %d 格", i)))
+		availableQty -= g.params.QtyPerGrid
 	}
 	g.lastIdx = idx
 
@@ -121,6 +134,8 @@ func (g *Grid) OnCandle(ctx *strategy.Context) []strategy.OrderIntent {
 
 // ApplyFill 成交回报（回测与执行器驱动），用于统计轮数与已实现利润。
 func (g *Grid) ApplyFill(side exchange.Side, qty, price float64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	switch side {
 	case exchange.Buy:
 		g.baseQty += qty
@@ -160,12 +175,14 @@ func (g *Grid) sellIntent(level int, note string) strategy.OrderIntent {
 
 // Stats 运行统计。
 type Stats struct {
-	Rounds   int     `json:"rounds"`    // 完成的低买高卖轮数
-	Realized float64 `json:"realized"`  // 已实现利润（Quote）
-	Broke    bool    `json:"broke"`     // 是否处于打穿下界状态
-	Position float64 `json:"position"`  // 当前持仓
+	Rounds   int     `json:"rounds"`   // 完成的低买高卖轮数
+	Realized float64 `json:"realized"` // 已实现利润（Quote）
+	Broke    bool    `json:"broke"`    // 是否处于打穿下界状态
+	Position float64 `json:"position"` // 当前持仓
 }
 
 func (g *Grid) Stats() Stats {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return Stats{Rounds: g.rounds, Realized: g.realized, Broke: g.broke, Position: g.baseQty}
 }

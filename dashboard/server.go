@@ -4,8 +4,10 @@ package dashboard
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,12 +24,12 @@ import (
 
 // Server 后台服务。
 type Server struct {
-	Cfg      *config.Config
-	Pf       *portfolio.Portfolio
-	Rk       *risk.Manager
-	Ex       OrderSource
-	Grid     *grid.Grid
-	Snapshots func() []exchange.Candle // 最近已确认 K 线
+	Cfg         *config.Config
+	Pf          *portfolio.Portfolio
+	Rk          *risk.Manager
+	Ex          OrderSource
+	Grid        *grid.Grid
+	Snapshots   func() []exchange.Candle // 最近已确认 K 线
 	RunBacktest func(ctx context.Context) (*backtest.Result, error)
 
 	mu      sync.Mutex
@@ -96,7 +98,11 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := s.Cfg.Dashboard.Token
 		if token != "" {
-			if r.Header.Get("Authorization") != "Bearer "+token {
+			provided := r.Header.Get("Authorization")
+			if provided == "" {
+				provided = "Bearer " + r.URL.Query().Get("token")
+			}
+			if subtle.ConstantTimeCompare([]byte(provided), []byte("Bearer "+token)) != 1 {
 				http.Error(w, "未授权", http.StatusUnauthorized)
 				return
 			}
@@ -125,20 +131,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	cash, positions, _ := s.Pf.Snapshot()
 	_, _, marks := s.Pf.Snapshot()
 	writeJSON(w, map[string]any{
-		"version": s.version,
-		"mode": s.Cfg.Mode,
-		"exchange": s.Cfg.Exchange.Name,
-		"market": s.Cfg.Exchange.Market,
-		"symbol": s.Cfg.Exchange.InstID,
-		"interval": s.Cfg.Trading.Interval,
-		"equity": s.Pf.Equity(),
-		"cash": cash,
-		"positions": positions,
-		"marks": marks,
-		"kill_switch": map[string]any{"tripped": s.Rk.Kill.Tripped(), "reason": s.Rk.Kill.Reason()},
+		"version":             s.version,
+		"mode":                s.Cfg.Mode,
+		"exchange":            s.Cfg.Exchange.Name,
+		"market":              s.Cfg.Exchange.Market,
+		"symbol":              s.Cfg.Exchange.InstID,
+		"interval":            s.Cfg.Trading.Interval,
+		"equity":              s.Pf.Equity(),
+		"cash":                cash,
+		"positions":           positions,
+		"marks":               marks,
+		"kill_switch":         map[string]any{"tripped": s.Rk.Kill.Tripped(), "reason": s.Rk.Kill.Reason()},
 		"daily_notional_used": s.Rk.DailyNotionalUsed(),
-		"risk_limits": s.Cfg.Risk,
-		"uptime_sec": int(time.Since(s.started).Seconds()),
+		"risk_limits":         s.Cfg.Risk,
+		"uptime_sec":          int(time.Since(s.started).Seconds()),
 	})
 }
 
@@ -175,11 +181,11 @@ func (s *Server) handleGrid(w http.ResponseWriter, r *http.Request) {
 // handleKillSwitch 唯一高危可写操作：trip 需 reason；reset 需确认词（防误触）。
 func (s *Server) handleKillSwitch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Action string `json:"action"` // trip | reset
-		Reason string `json:"reason"`
+		Action  string `json:"action"` // trip | reset
+		Reason  string `json:"reason"`
 		Confirm string `json:"confirm"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		http.Error(w, "请求体非法", http.StatusBadRequest)
 		return
 	}
@@ -190,7 +196,11 @@ func (s *Server) handleKillSwitch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.Rk.Kill.Trip(req.Reason)
-		go s.Ex.CancelAll(r.Context(), s.Cfg.Exchange.InstID) // 触发即撤单
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			s.Ex.CancelAll(ctx, s.Cfg.Exchange.InstID)
+		}() // 触发即撤单
 		s.Broadcast("kill_switch", map[string]any{"tripped": true, "reason": req.Reason})
 		writeJSON(w, map[string]any{"tripped": true, "reason": req.Reason})
 	case "reset":
@@ -228,7 +238,7 @@ func (s *Server) handleBacktest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	// 只读视图；密钥不在 config 里（走环境变量），无脱敏需求
-	writeJSON(w, s.Cfg)
+	writeJSON(w, s.Cfg.Sanitized())
 }
 
 // handleSSE 事件流。

@@ -8,8 +8,15 @@ import type {
   Status,
 } from './types'
 
+const token = localStorage.getItem('quantforge_token') ?? ''
+const authHeaders = (): Record<string, string> =>
+  token ? { Authorization: `Bearer ${token}` } : {}
+
+export const streamURL = () =>
+  token ? `/api/stream?token=${encodeURIComponent(token)}` : '/api/stream'
+
 async function get<T>(path: string): Promise<T> {
-  const resp = await fetch(path)
+  const resp = await fetch(path, { headers: authHeaders() })
   if (!resp.ok) throw new Error(`${path}: HTTP ${resp.status}`)
   return resp.json()
 }
@@ -17,7 +24,7 @@ async function get<T>(path: string): Promise<T> {
 async function post<T>(path: string, body: unknown): Promise<T> {
   const resp = await fetch(path, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   })
   if (!resp.ok) {

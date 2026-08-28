@@ -51,3 +51,6 @@ data/logs/
 config.json
 .zcode/
 web/tsconfig.tsbuildinfo
+
+# 本机工具权限配置不入库（agents 角色定义保留）
+.claude/settings.local.json

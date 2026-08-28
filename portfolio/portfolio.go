@@ -1,120 +1,223 @@
-// Package portfolio 仓位与权益管理：持仓、可用余额、权益曲线口径（equity = cash + Σ qty×mark）。
+// Package portfolio 仓位与权益管理：持仓、可用余额、权益曲线口径。
 package portfolio
 
 import (
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/HarveyBase/QuantForge/exchange"
 )
 
-// Position 单标的持仓（净持仓口径）。
 type Position struct {
 	Symbol    string  `json:"symbol"`
-	Qty       float64 `json:"qty"`        // 持仓数量（有符号，负=空头，仅合约）
-	AvgPrice  float64 `json:"avg_price"`  // 开仓均价
-	Available float64 `json:"available"`  // 可卖数量（冻结剔除；卖出校验用它）
+	Qty       float64 `json:"qty"`
+	AvgPrice  float64 `json:"avg_price"`
+	Available float64 `json:"available"`
 }
 
-// Portfolio 账户状态。Available 概念对现货是"未挂单冻结"，对 T+1 市场是"非当日买入"——加密现货无 T+1，但卖出前校验可用是通用纪律。
+type freezeEntry struct {
+	req       exchange.OrderRequest
+	remaining float64
+}
+
 type Portfolio struct {
 	mu        sync.RWMutex
-	Cash      float64              `json:"cash"` // 计价货币（USDT）
+	Cash      float64              `json:"cash"`
 	Positions map[string]*Position `json:"positions"`
-	marks     map[string]float64   // symbol -> 标记价
+	marks     map[string]float64
+	freezes   map[string]freezeEntry
 }
 
 func New(seedCash float64) *Portfolio {
-	return &Portfolio{
-		Cash:      seedCash,
-		Positions: map[string]*Position{},
-		marks:     map[string]float64{},
+	return &Portfolio{Cash: seedCash, Positions: map[string]*Position{}, marks: map[string]float64{}, freezes: map[string]freezeEntry{}}
+}
+
+// Seed 用交易所余额初始化现货账本。余额中的 Available 用于可交易资产。
+func (p *Portfolio) Seed(balances []exchange.Balance, symbol, base, quote string, mark float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, b := range balances {
+		if b.Asset == quote {
+			p.Cash = b.Available
+		}
+		if b.Asset == base && b.Available > 0 {
+			p.Positions[symbol] = &Position{Symbol: symbol, Qty: b.Available, Available: b.Available, AvgPrice: mark}
+		}
+	}
+	if mark > 0 {
+		p.marks[base] = mark
 	}
 }
 
-// UpdateMark 更新标记价（权益按 mark 计算）。
 func (p *Portfolio) UpdateMark(symbol string, price float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.updateMarkLocked(symbol, price)
+}
+func (p *Portfolio) updateMarkLocked(symbol string, price float64) {
 	if price > 0 {
 		p.marks[symbol] = price
 	}
 }
-
-// Mark 当前标记价（无价返回 0）。
 func (p *Portfolio) Mark(symbol string) float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.marks[symbol]
 }
 
-// ApplyTrade 应用一笔成交：更新现金与持仓（含手续费）。
 func (p *Portfolio) ApplyTrade(o exchange.Order) {
 	if o.FilledQty <= 0 {
 		return
 	}
+	p.applyFill(exchange.Fill{Symbol: o.Symbol, ClientOrderID: o.ClientOrderID, Side: o.Side, Qty: o.FilledQty, Price: o.AvgPrice, Fee: o.Fee, FeeCcy: o.FeeCcy, Ts: o.UpdatedAt})
+}
+
+// ApplyFill 应用一笔增量成交，并自动消费对应订单的冻结。
+func (p *Portfolio) ApplyFill(f exchange.Fill) {
+	if f.Qty <= 0 || f.Price <= 0 {
+		return
+	}
+	p.applyFill(f)
+}
+
+func (p *Portfolio) applyFill(f exchange.Fill) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	notional := o.FilledQty * o.AvgPrice
-	pos, ok := p.Positions[o.Symbol]
-	if !ok {
-		pos = &Position{Symbol: o.Symbol}
-		p.Positions[o.Symbol] = pos
+	pos := p.Positions[f.Symbol]
+	if pos == nil {
+		pos = &Position{Symbol: f.Symbol}
+		p.Positions[f.Symbol] = pos
 	}
-	switch o.Side {
+	frozen := false
+	if f.ClientOrderID != "" {
+		if entry, ok := p.freezes[f.ClientOrderID]; ok {
+			frozen = true
+			qty := f.Qty
+			if qty > entry.remaining {
+				qty = entry.remaining
+			}
+			if entry.req.Side == exchange.Buy {
+				p.Cash += entry.req.Price * qty
+			}
+		}
+	}
+	notional := f.Qty * f.Price
+	switch f.Side {
 	case exchange.Buy:
-		newQty := pos.Qty + o.FilledQty
-		if pos.Qty >= 0 { // 加仓：摊均价
-			pos.AvgPrice = (pos.AvgPrice*pos.Qty + notional) / newQty
-		} else if pos.Qty+o.FilledQty >= 0 { // 空头完全回补，均价清零
-			pos.AvgPrice = 0
+		newQty := pos.Qty + f.Qty
+		if newQty > 0 {
+			if pos.Qty >= 0 {
+				pos.AvgPrice = (pos.AvgPrice*pos.Qty + notional) / newQty
+			}
+			// 买入的币即时可用：买单冻结占用的是现金而非币（卖侧冻结才扣 Available）
+			pos.Available += f.Qty
 		}
 		pos.Qty = newQty
-		pos.Available += o.FilledQty
 		p.Cash -= notional
 	case exchange.Sell:
-		pos.Qty -= o.FilledQty
-		pos.Available -= o.FilledQty
+		pos.Qty -= f.Qty
+		if !frozen {
+			pos.Available -= f.Qty
+		}
 		p.Cash += notional
+		if math.Abs(pos.Qty) < 1e-12 {
+			pos.Qty = 0
+			pos.AvgPrice = 0
+		}
 	}
-	fee := -o.Fee // Fee 负=已支付
-	if fee > 0 {
-		p.Cash -= fee
+	if f.Fee < 0 {
+		p.Cash += f.Fee
+	} else {
+		p.Cash -= f.Fee
 	}
-	p.UpdateMarkLocked(o.Symbol, o.AvgPrice)
-	if approx(pos.Qty, 0) {
-		pos.AvgPrice = 0
+	p.updateMarkLocked(f.Symbol, f.Price)
+	if frozen && f.ClientOrderID != "" {
+		entry := p.freezes[f.ClientOrderID]
+		entry.remaining -= f.Qty
+		if entry.remaining < 0 {
+			entry.remaining = 0
+		}
+		p.freezes[f.ClientOrderID] = entry
 	}
 }
 
-func (p *Portfolio) UpdateMarkLocked(symbol string, price float64) {
-	if price > 0 {
-		p.marks[symbol] = price
+func freezeKey(req exchange.OrderRequest) string {
+	if req.ClientOrderID != "" {
+		return req.ClientOrderID
 	}
+	return fmt.Sprintf("%s:%s:%g:%g", req.Symbol, req.Side, req.Price, req.Qty)
 }
 
-// Freeze / Release 挂单资金占用（可用余额管理）。
-func (p *Portfolio) Freeze(o exchange.OrderRequest) {
+// Freeze 按订单精确冻结现金或可卖数量；失败时不改变账本。
+func (p *Portfolio) Freeze(req exchange.OrderRequest) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if o.Side == exchange.Buy {
-		p.Cash -= o.Price * o.Qty
-	} else if pos := p.Positions[o.Symbol]; pos != nil {
-		pos.Available -= o.Qty
+	key := freezeKey(req)
+	if _, ok := p.freezes[key]; ok {
+		return true
 	}
+	amount := req.Price * req.Qty
+	if req.Side == exchange.Buy {
+		if req.Price <= 0 || amount > p.Cash+1e-12 {
+			return false
+		}
+		p.Cash -= amount
+	} else if req.Side == exchange.Sell {
+		pos := p.Positions[req.Symbol]
+		if pos == nil || req.Qty <= 0 || req.Qty > pos.Available+1e-12 {
+			return false
+		}
+		pos.Available -= req.Qty
+	} else {
+		return false
+	}
+	p.freezes[key] = freezeEntry{req: req, remaining: req.Qty}
+	return true
 }
 
-func (p *Portfolio) Release(o exchange.OrderRequest) {
+// Release 释放订单剩余冻结；重复调用幂等。
+func (p *Portfolio) Release(req exchange.OrderRequest) { p.ReleaseOrder(freezeKey(req)) }
+func (p *Portfolio) ReleaseOrder(clientOrderID string) {
+	if clientOrderID == "" {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if o.Side == exchange.Buy {
-		p.Cash += o.Price * o.Qty
-	} else if pos := p.Positions[o.Symbol]; pos != nil {
-		pos.Available += o.Qty
+	f, ok := p.freezes[clientOrderID]
+	if !ok {
+		return
+	}
+	p.releaseLocked(f.req, f.remaining)
+	delete(p.freezes, clientOrderID)
+}
+
+// ConsumeFreeze 消耗成交对应的冻结量，终态时调用 ReleaseOrder 释放剩余量。
+func (p *Portfolio) ConsumeFreeze(clientOrderID string, qty float64) {
+	if clientOrderID == "" || qty <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f, ok := p.freezes[clientOrderID]
+	if !ok {
+		return
+	}
+	if qty > f.remaining {
+		qty = f.remaining
+	}
+	f.remaining -= qty
+	p.freezes[clientOrderID] = f
+}
+
+func (p *Portfolio) releaseLocked(req exchange.OrderRequest, qty float64) {
+	if req.Side == exchange.Buy {
+		p.Cash += req.Price * qty
+	} else if pos := p.Positions[req.Symbol]; pos != nil {
+		pos.Available += qty
 	}
 }
 
-// Equity 总权益 = cash + Σ qty×mark。
 func (p *Portfolio) Equity() float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -124,8 +227,6 @@ func (p *Portfolio) Equity() float64 {
 	}
 	return e
 }
-
-// PositionNotional 单标的敞口名义价值（USD 估算）。
 func (p *Portfolio) PositionNotional(symbol string) float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -137,33 +238,29 @@ func (p *Portfolio) PositionNotional(symbol string) float64 {
 	if mark == 0 {
 		mark = pos.AvgPrice
 	}
-	return pos.Qty * mark
+	return math.Abs(pos.Qty * mark)
 }
-
-// Snapshot 只读副本（dashboard/回测输出用）。
-func (p *Portfolio) Snapshot() (cash float64, positions []Position, marks map[string]float64) {
+func (p *Portfolio) Snapshot() (float64, []Position, map[string]float64) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	positions = make([]Position, 0, len(p.Positions))
+	ps := make([]Position, 0, len(p.Positions))
 	for _, pos := range p.Positions {
-		positions = append(positions, *pos)
+		ps = append(ps, *pos)
 	}
-	marks = make(map[string]float64, len(p.marks))
+	ms := make(map[string]float64, len(p.marks))
 	for k, v := range p.marks {
-		marks[k] = v
+		ms[k] = v
 	}
-	return p.Cash, positions, marks
+	return p.Cash, ps, ms
 }
 
-// Reconcile 对账：本地持仓 vs 交易所回报，差异非零即告警项。
 func (p *Portfolio) Reconcile(balances []exchange.Balance, positions []Position) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	var diffs []string
 	for _, b := range balances {
-		switch b.Asset {
-		case "USDT":
-			if diff := b.Total - p.Cash; abs(diff) > max(1.0, abs(p.Cash)*0.001) {
+		if b.Asset == "USDT" {
+			if d := b.Total - p.Cash; abs(d) > max(1, abs(p.Cash)*.001) {
 				diffs = append(diffs, fmt.Sprintf("USDT 差异: 本地 %.2f vs 交易所 %.2f", p.Cash, b.Total))
 			}
 		}
@@ -174,22 +271,18 @@ func (p *Portfolio) Reconcile(balances []exchange.Balance, positions []Position)
 		if local != nil {
 			lq = local.Qty
 		}
-		if diff := ep.Qty - lq; abs(diff) > 1e-8 {
+		if d := ep.Qty - lq; abs(d) > 1e-8 {
 			diffs = append(diffs, fmt.Sprintf("%s 持仓差异: 本地 %.8f vs 交易所 %.8f", ep.Symbol, lq, ep.Qty))
 		}
 	}
 	return diffs
 }
-
-func approx(a, b float64) bool { return abs(a-b) < 1e-12 }
-
 func abs(v float64) float64 {
 	if v < 0 {
 		return -v
 	}
 	return v
 }
-
 func max(a, b float64) float64 {
 	if a > b {
 		return a

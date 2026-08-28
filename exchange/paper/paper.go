@@ -25,6 +25,7 @@ type Exchange struct {
 	balances map[string]float64 // asset -> available
 	open     map[string]exchange.Order
 	all      map[string]exchange.Order
+	byClient map[string]string
 	seq      int
 	fill     FillModel
 	nowFn    func() int64
@@ -38,7 +39,8 @@ func New(seedPrice, seedCash float64, model FillModel) *Exchange {
 	return &Exchange{
 		last: seedPrice, balances: map[string]float64{"USDT": seedCash},
 		open: map[string]exchange.Order{}, all: map[string]exchange.Order{},
-		fill: model, nowFn: func() int64 { return time.Now().UnixMilli() },
+		byClient: map[string]string{},
+		fill:     model, nowFn: func() int64 { return time.Now().UnixMilli() },
 	}
 }
 
@@ -94,9 +96,14 @@ func (e *Exchange) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (e
 		e.fillOrder(&o, req.Price)
 	} else {
 		// 挂单占用资金
-		e.reserve(o)
+		if !e.reserve(o) {
+			o.Status = exchange.StatusRejected
+		}
 	}
 	e.all[id] = o
+	if req.ClientOrderID != "" {
+		e.byClient[req.ClientOrderID] = id
+	}
 	if !o.Status.Terminal() {
 		e.open[id] = o
 	}
@@ -128,6 +135,20 @@ func (e *Exchange) GetOrder(ctx context.Context, symbol, orderID string) (exchan
 	return o, nil
 }
 
+func (e *Exchange) GetOrderByClientID(ctx context.Context, symbol, clientOrderID string) (exchange.Order, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	id, ok := e.byClient[clientOrderID]
+	if !ok {
+		return exchange.Order{}, fmt.Errorf("paper: clientOrderID 不存在 %s", clientOrderID)
+	}
+	o := e.all[id]
+	if symbol != "" && o.Symbol != symbol {
+		return exchange.Order{}, fmt.Errorf("paper: clientOrderID %s 不属于 %s", clientOrderID, symbol)
+	}
+	return o, nil
+}
+
 func (e *Exchange) GetOpenOrders(ctx context.Context, symbol string) ([]exchange.Order, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -149,12 +170,23 @@ func (e *Exchange) UpdatePrice(p float64) {
 	}
 	e.last = p
 	for id, o := range e.open {
-		if o.Type == exchange.OrderLimit && e.priceTouches(o.Side, o.Price) {
-			e.release(o)
-			e.fillOrder(&o, o.Price)
-			o.UpdatedAt = e.nowFn()
-			e.all[id] = o
+		if o.Type != exchange.OrderLimit || !e.priceTouches(o.Side, o.Price) {
+			continue
+		}
+		e.releaseRemaining(o)
+		e.fillOrder(&o, o.Price)
+		o.UpdatedAt = e.nowFn()
+		e.all[id] = o
+		if o.Status.Terminal() {
 			delete(e.open, id)
+		} else {
+			if !e.reserveRemaining(o) {
+				o.Status = exchange.StatusRejected
+				e.all[id] = o
+				delete(e.open, id)
+			} else {
+				e.open[id] = o
+			}
 		}
 	}
 }
@@ -174,7 +206,16 @@ func (e *Exchange) priceTouches(side exchange.Side, price float64) bool {
 }
 
 func (e *Exchange) fillOrder(o *exchange.Order, px float64) {
-	qty := o.Qty * e.fill.PartialRatio
+	remaining := o.Qty - o.FilledQty
+	if remaining <= 1e-12 {
+		o.Status = exchange.StatusFilled
+		return
+	}
+	qty := remaining * e.fill.PartialRatio
+	if qty <= 1e-12 {
+		// 尘埃尾差：剩余量太小再打折就永远凑不满，直接一次性补齐，避免订单卡死在部分成交
+		qty = remaining
+	}
 	notional := qty * px
 	fee := notional * e.fill.FeeBps / 10000
 	base, quote := "BTC", "USDT"
@@ -193,30 +234,56 @@ func (e *Exchange) fillOrder(o *exchange.Order, px float64) {
 		e.balances[base] -= qty
 		e.balances[quote] += notional - fee
 	}
-	o.FilledQty = qty
-	o.AvgPrice = px
-	o.Fee = -fee
+	oldQty := o.FilledQty
+	o.FilledQty += qty
+	o.AvgPrice = (o.AvgPrice*oldQty + px*qty) / o.FilledQty
+	o.Fee -= fee
 	o.FeeCcy = quote
-	if qty+1e-12 >= o.Qty {
+	if o.FilledQty+1e-12 >= o.Qty {
+		o.FilledQty = o.Qty
 		o.Status = exchange.StatusFilled
 	} else {
 		o.Status = exchange.StatusPartiallyFilled
 	}
 }
 
-func (e *Exchange) reserve(o exchange.Order) {
-	// 限价挂单冻结对应资金（简化：全额冻结）
-	if o.Side == exchange.Buy {
-		e.balances["USDT"] -= o.Price * o.Qty
-	} else {
-		e.balances["BTC"] -= o.Qty
-	}
+func (e *Exchange) reserve(o exchange.Order) bool {
+	return e.reserveQty(o, o.Qty)
 }
 
-func (e *Exchange) release(o exchange.Order) {
+func (e *Exchange) reserveRemaining(o exchange.Order) bool {
+	return e.reserveQty(o, o.Qty-o.FilledQty)
+}
+
+func (e *Exchange) reserveQty(o exchange.Order, qty float64) bool {
+	if qty <= 0 {
+		return true
+	}
 	if o.Side == exchange.Buy {
-		e.balances["USDT"] += o.Price * o.Qty
+		amount := o.Price * qty
+		if e.balances["USDT"] < amount {
+			return false
+		}
+		e.balances["USDT"] -= amount
+		return true
+	}
+	if e.balances["BTC"] < qty {
+		return false
+	}
+	e.balances["BTC"] -= qty
+	return true
+}
+
+func (e *Exchange) release(o exchange.Order) { e.releaseRemaining(o) }
+
+func (e *Exchange) releaseRemaining(o exchange.Order) {
+	qty := o.Qty - o.FilledQty
+	if qty <= 0 {
+		return
+	}
+	if o.Side == exchange.Buy {
+		e.balances["USDT"] += o.Price * qty
 	} else {
-		e.balances["BTC"] += o.Qty
+		e.balances["BTC"] += qty
 	}
 }

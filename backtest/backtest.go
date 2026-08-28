@@ -23,14 +23,14 @@ type CostModel struct {
 
 // Result 回测结果。
 type Result struct {
-	Trades          []exchange.Order  `json:"trades"`           // 成交记录
-	PendingOrders   []exchange.Order  `json:"pending_orders"`   // 期末未成交挂单
-	RiskRejections  []risk.Rejection  `json:"risk_rejections"`  // 风控拒单
-	EquityCurve     []EquityPoint     `json:"equity_curve"`     // 权益曲线
-	Metrics         Metrics           `json:"metrics"`
-	SampleFrom      int64             `json:"sample_from"`      // 样本区间（ms）
-	SampleTo        int64             `json:"sample_to"`
-	NumTrials       int               `json:"num_trials"`       // 试验次数（防数据窥探：多次回测须累计）
+	Trades         []exchange.Order `json:"trades"`          // 成交记录
+	PendingOrders  []exchange.Order `json:"pending_orders"`  // 期末未成交挂单
+	RiskRejections []risk.Rejection `json:"risk_rejections"` // 风控拒单
+	EquityCurve    []EquityPoint    `json:"equity_curve"`    // 权益曲线
+	Metrics        Metrics          `json:"metrics"`
+	SampleFrom     int64            `json:"sample_from"` // 样本区间（ms）
+	SampleTo       int64            `json:"sample_to"`
+	NumTrials      int              `json:"num_trials"` // 试验次数（防数据窥探：多次回测须累计）
 }
 
 // EquityPoint 权益检查点。
@@ -71,6 +71,9 @@ func (e *Engine) Run(candles []exchange.Candle, symbol, interval string, numTria
 	if len(candles) == 0 {
 		return nil, fmt.Errorf("backtest: 空 K 线")
 	}
+	if e.SeedCash <= 0 || math.IsNaN(e.SeedCash) || math.IsInf(e.SeedCash, 0) {
+		return nil, fmt.Errorf("backtest: 初始资金必须为有限正数")
+	}
 	pf := portfolio.New(e.SeedCash)
 	rk := risk.NewManager(risk.Limits{
 		MaxOrderNotionalUSD:    math.Inf(1), // 回测不设限额？不——沿用默认上限的语义由调用方决定；
@@ -81,10 +84,10 @@ func (e *Engine) Run(candles []exchange.Candle, symbol, interval string, numTria
 	}, pf, "")
 
 	var (
-		trades   []exchange.Order
-		pending  []pendingOrder
-		curve    []EquityPoint
-		rejects  []risk.Rejection
+		trades  []exchange.Order
+		pending []pendingOrder
+		curve   []EquityPoint
+		rejects []risk.Rejection
 	)
 
 	warmup := e.Strategy.Warmup()
@@ -98,13 +101,17 @@ func (e *Engine) Run(candles []exchange.Candle, symbol, interval string, numTria
 			o := p.order
 			if p.isMarket {
 				o = fillMarket(o, c, e.Cost)
-				pf.ApplyTrade(o)
+				pf.ApplyFill(exchange.Fill{Symbol: o.Symbol, ClientOrderID: o.ClientOrderID, Side: o.Side, Qty: o.FilledQty, Price: o.AvgPrice, Fee: o.Fee, Ts: o.UpdatedAt})
+				pf.ReleaseOrder(o.ClientOrderID)
+				applyStrategyFill(e.Strategy, o)
 				trades = append(trades, o)
 				continue
 			}
 			if limitTouched(c, o) {
 				o = fillLimit(o, c, e.Cost)
-				pf.ApplyTrade(o)
+				pf.ApplyFill(exchange.Fill{Symbol: o.Symbol, ClientOrderID: o.ClientOrderID, Side: o.Side, Qty: o.FilledQty, Price: o.AvgPrice, Fee: o.Fee, Ts: o.UpdatedAt})
+				pf.ReleaseOrder(o.ClientOrderID)
+				applyStrategyFill(e.Strategy, o)
 				trades = append(trades, o)
 				continue
 			}
@@ -132,19 +139,27 @@ func (e *Engine) Run(candles []exchange.Candle, symbol, interval string, numTria
 		}
 
 		// 3. 策略产出意图 → 4. 风控门禁 → 5. 撮合
-		for _, intent := range e.Strategy.OnCandle(sctx) {
+		for intentIndex, intent := range e.Strategy.OnCandle(sctx) {
 			req := exchange.OrderRequest{
 				Symbol: symbol, Side: intent.Side, Type: intent.Type,
 				Price: intent.Price, Qty: intent.Qty,
-				ClientOrderID: fmt.Sprintf("bt-%d-%s", c.OpenTime, intent.Kind),
+				ClientOrderID: fmt.Sprintf("bt-%d-%s-%d", c.OpenTime, intent.Kind, intentIndex),
 			}
 			if err := rk.CheckOrder(req, c.Close); err != nil {
 				rejects = append(rejects, risk.Rejection{Ts: time.UnixMilli(c.OpenTime), RuleID: "BT_RISK", Reason: err.Error(), Order: req})
 				continue
 			}
+			freezeReq := req
+			if freezeReq.Price == 0 {
+				freezeReq.Price = c.Close
+			}
+			if !pf.Freeze(freezeReq) {
+				rejects = append(rejects, risk.Rejection{Ts: time.UnixMilli(c.OpenTime), RuleID: "BT_FREEZE", Reason: "可用资金或持仓不足", Order: req})
+				continue
+			}
 			o := exchange.Order{
-				Exchange: "backtest", Symbol: symbol, Side: intent.Side, Type: intent.Type,
-				Price: intent.Price, Qty: intent.Qty, Status: exchange.StatusSubmitted,
+				Exchange: "backtest", Symbol: symbol, ClientOrderID: req.ClientOrderID, Side: intent.Side, Type: intent.Type,
+				Price: freezeReq.Price, Qty: intent.Qty, Status: exchange.StatusSubmitted,
 				CreatedAt: c.OpenTime, UpdatedAt: c.OpenTime,
 			}
 			// 当根不成交：一律入队，下一根起结算
@@ -164,6 +179,14 @@ func (e *Engine) Run(candles []exchange.Candle, symbol, interval string, numTria
 	}
 	res.Metrics = computeMetrics(curve, trades, e.SeedCash, first.Close, last.Close)
 	return res, nil
+}
+
+func applyStrategyFill(s strategy.Strategy, o exchange.Order) {
+	if applier, ok := s.(interface {
+		ApplyFill(exchange.Side, float64, float64)
+	}); ok {
+		applier.ApplyFill(o.Side, o.FilledQty, o.AvgPrice)
+	}
 }
 
 // limitTouched 限价单在本根是否触及。
@@ -207,12 +230,18 @@ func fillLimit(o exchange.Order, c exchange.Candle, cost CostModel) exchange.Ord
 			fillPx = c.Open
 		}
 		fillPx *= 1 + cost.SlippageBps/10000
+		if fillPx > o.Price {
+			fillPx = o.Price
+		}
 		o.Fee = -(o.Qty * fillPx * cost.MakerFeeBps / 10000)
 	} else {
 		if c.Open > o.Price {
 			fillPx = c.Open
 		}
 		fillPx *= 1 - cost.SlippageBps/10000
+		if fillPx < o.Price {
+			fillPx = o.Price
+		}
 		o.Fee = -(o.Qty * fillPx * cost.MakerFeeBps / 10000)
 	}
 	o.FilledQty = o.Qty
