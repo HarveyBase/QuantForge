@@ -17,6 +17,6 @@ type OrderSource interface {
 // NoopExecutor research 模式的空执行器（无订单、无事件、撤单无效）。
 type NoopExecutor struct{}
 
-func (NoopExecutor) OpenOrders() []exchange.Order            { return nil }
-func (NoopExecutor) Events(int) []execution.Event            { return nil }
-func (NoopExecutor) CancelAll(context.Context, string) int   { return 0 }
+func (NoopExecutor) OpenOrders() []exchange.Order          { return nil }
+func (NoopExecutor) Events(int) []execution.Event          { return nil }
+func (NoopExecutor) CancelAll(context.Context, string) int { return 0 }

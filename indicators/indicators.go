@@ -135,3 +135,78 @@ func Crossover(a, b []float64, i int) bool {
 	}
 	return a[i-1] <= b[i-1] && a[i] > b[i]
 }
+
+// EfficiencyRatio Kaufman 效率比（ER）= |净位移| / 路径总长，衡量趋势干净度。
+// 趋势市：价格近似直行，ER → 1；震荡市：来回拉锯，ER → 0。
+// 与 ATR 配合可做市况识别（regime）：ER 高开趋势策略、ER 低开网格。
+func EfficiencyRatio(closes []float64, period int) []float64 {
+	out := make([]float64, len(closes))
+	for i := range closes {
+		if i < period {
+			out[i] = math.NaN()
+			continue
+		}
+		net := math.Abs(closes[i] - closes[i-period])
+		path := 0.0
+		for j := i - period + 1; j <= i; j++ {
+			path += math.Abs(closes[j] - closes[j-1])
+		}
+		if path <= 0 {
+			out[i] = 0
+			continue
+		}
+		out[i] = net / path
+	}
+	return out
+}
+
+// RSI 相对强弱指数（Wilder 平滑），前 period 个为 NaN。
+// >70 超买、<30 超卖（经典阈值；仅用截至当前数据，防前视由调用方保证）。
+func RSI(closes []float64, period int) []float64 {
+	out := make([]float64, len(closes))
+	if len(closes) <= period {
+		for i := range out {
+			out[i] = math.NaN()
+		}
+		return out
+	}
+	var avgGain, avgLoss float64
+	for i := 1; i <= period; i++ {
+		d := closes[i] - closes[i-1]
+		if d > 0 {
+			avgGain += d
+		} else {
+			avgLoss -= d
+		}
+	}
+	avgGain /= float64(period)
+	avgLoss /= float64(period)
+	out[period] = rsiFrom(avgGain, avgLoss)
+	for i := 0; i < period; i++ {
+		out[i] = math.NaN()
+	}
+	for i := period + 1; i < len(closes); i++ {
+		d := closes[i] - closes[i-1]
+		g, l := 0.0, 0.0
+		if d > 0 {
+			g = d
+		} else {
+			l = -d
+		}
+		avgGain = (avgGain*float64(period-1) + g) / float64(period)
+		avgLoss = (avgLoss*float64(period-1) + l) / float64(period)
+		out[i] = rsiFrom(avgGain, avgLoss)
+	}
+	return out
+}
+
+func rsiFrom(avgGain, avgLoss float64) float64 {
+	switch {
+	case avgLoss == 0 && avgGain == 0:
+		return 50
+	case avgLoss == 0:
+		return 100
+	default:
+		return 100 - 100/(1+avgGain/avgLoss)
+	}
+}

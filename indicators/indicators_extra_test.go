@@ -138,3 +138,86 @@ func TestCrossoverEqualNotCross(t *testing.T) {
 		t.Fatal("未超越不应判定上穿")
 	}
 }
+
+func TestEfficiencyRatio(t *testing.T) {
+	// 完美直线：ER = 1
+	line := make([]float64, 20)
+	for i := range line {
+		line[i] = float64(100 + i)
+	}
+	er := EfficiencyRatio(line, 10)
+	if !approx(er[15], 1) {
+		t.Fatalf("直线 ER 应为 1: %v", er[15])
+	}
+	// 完美锯齿：净位移 0 → ER = 0
+	saw := make([]float64, 20)
+	for i := range saw {
+		if i%2 == 0 {
+			saw[i] = 100
+		} else {
+			saw[i] = 101
+		}
+	}
+	er2 := EfficiencyRatio(saw, 10)
+	if !approx(er2[15], 0) {
+		t.Fatalf("锯齿 ER 应为 0: %v", er2[15])
+	}
+	// 预热期 NaN
+	if !math.IsNaN(er[5]) {
+		t.Fatal("period 内应为 NaN")
+	}
+	// 空输入
+	if out := EfficiencyRatio(nil, 5); len(out) != 0 {
+		t.Fatal("空输入应返回空")
+	}
+	// 常数序列（路径 0）→ 0 而非 NaN
+	flat := make([]float64, 15)
+	er3 := EfficiencyRatio(flat, 5)
+	if !approx(er3[10], 0) {
+		t.Fatalf("常数序列 ER 应为 0: %v", er3[10])
+	}
+}
+
+func TestRSI(t *testing.T) {
+	// 单边上涨：RSI = 100
+	up := make([]float64, 30)
+	for i := range up {
+		up[i] = 100 + float64(i)
+	}
+	r := RSI(up, 14)
+	if !math.IsNaN(r[10]) {
+		t.Fatal("预热期应为 NaN")
+	}
+	if !approx(r[25], 100) {
+		t.Fatalf("单边上涨 RSI 应 100: %v", r[25])
+	}
+	// 单边下跌：RSI = 0
+	down := make([]float64, 30)
+	for i := range down {
+		down[i] = 100 - float64(i)
+	}
+	if !approx(RSI(down, 14)[25], 0) {
+		t.Fatal("单边下跌 RSI 应 0")
+	}
+	// 常数序列：无涨跌 → 50
+	flat := make([]float64, 30)
+	if !approx(RSI(flat, 14)[25], 50) {
+		t.Fatal("常数序列 RSI 应 50")
+	}
+	// 混合序列手算：14 根里 7 涨 1、7 跌 1 → AG=AL=0.5, RS=1 → 50
+	mix := make([]float64, 30)
+	for i := 1; i < 30; i++ {
+		if i%2 == 1 {
+			mix[i] = mix[i-1] + 1
+		} else {
+			mix[i] = mix[i-1] - 1
+		}
+	}
+	if !approx(RSI(mix, 14)[14], 50) {
+		t.Fatalf("对称涨跌 RSI 应 50: %v", RSI(mix, 14)[14])
+	}
+	// 空输入
+	if out := RSI(nil, 14); len(out) != 0 {
+		t.Fatal("空输入应返回空")
+	}
+}

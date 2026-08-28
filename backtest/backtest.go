@@ -49,6 +49,8 @@ type Metrics struct {
 	Calmar         float64 `json:"calmar"`           // 总收益% / |MDD%|（口径：非年化）
 	TradeCount     int     `json:"trade_count"`
 	WinRate        float64 `json:"win_rate"`
+	AvgWinPct      float64 `json:"avg_win_pct"`  // 平均盈利幅度%（卖出/配对成本−1，仅盈利笔）
+	AvgLossPct     float64 `json:"avg_loss_pct"` // 平均亏损幅度%（正数，仅亏损笔）
 	TotalFees      float64 `json:"total_fees"`
 	FinalEquity    float64 `json:"final_equity"`
 }
@@ -177,7 +179,7 @@ func (e *Engine) Run(candles []exchange.Candle, symbol, interval string, numTria
 		EquityCurve: curve, SampleFrom: first.OpenTime, SampleTo: last.OpenTime,
 		NumTrials: numTrials,
 	}
-	res.Metrics = computeMetrics(curve, trades, e.SeedCash, first.Close, last.Close)
+	res.Metrics = ComputeMetrics(curve, trades, e.SeedCash, first.Close, last.Close)
 	return res, nil
 }
 
@@ -251,9 +253,9 @@ func fillLimit(o exchange.Order, c exchange.Candle, cost CostModel) exchange.Ord
 	return o
 }
 
-// computeMetrics 指标口径（docs/02）：
+// ComputeMetrics 指标口径（docs/02）：
 // MDD 基于权益曲线峰谷复算；Sharpe 用逐期收益 × √periods_per_year；胜率按移动成本法配对核算。
-func computeMetrics(curve []EquityPoint, trades []exchange.Order, seed, firstPx, lastPx float64) Metrics {
+func ComputeMetrics(curve []EquityPoint, trades []exchange.Order, seed, firstPx, lastPx float64) Metrics {
 	m := Metrics{FinalEquity: seed}
 	if len(curve) == 0 {
 		return m
@@ -316,6 +318,7 @@ func computeMetrics(curve []EquityPoint, trades []exchange.Order, seed, firstPx,
 	fees, wins, sells := 0.0, 0, 0
 	avgCost := 0.0 // 单标的移动成本
 	qty := 0.0
+	var winPcts, lossPcts []float64
 	for _, tr := range trades {
 		fees += -tr.Fee
 		switch tr.Side {
@@ -323,8 +326,14 @@ func computeMetrics(curve []EquityPoint, trades []exchange.Order, seed, firstPx,
 			avgCost = (avgCost*qty + tr.AvgPrice*tr.FilledQty) / (qty + tr.FilledQty)
 			qty += tr.FilledQty
 		case exchange.Sell:
-			if qty > 0 && tr.AvgPrice > avgCost {
-				wins++
+			if qty > 0 && avgCost > 0 {
+				retPct := (tr.AvgPrice/avgCost - 1) * 100
+				if tr.AvgPrice > avgCost {
+					wins++
+					winPcts = append(winPcts, retPct)
+				} else {
+					lossPcts = append(lossPcts, -retPct)
+				}
 			}
 			qty -= tr.FilledQty
 			sells++
@@ -333,6 +342,20 @@ func computeMetrics(curve []EquityPoint, trades []exchange.Order, seed, firstPx,
 	m.TotalFees = fees
 	if sells > 0 {
 		m.WinRate = float64(wins) / float64(sells) * 100
+	}
+	if len(winPcts) > 0 {
+		sum := 0.0
+		for _, v := range winPcts {
+			sum += v
+		}
+		m.AvgWinPct = sum / float64(len(winPcts))
+	}
+	if len(lossPcts) > 0 {
+		sum := 0.0
+		for _, v := range lossPcts {
+			sum += v
+		}
+		m.AvgLossPct = sum / float64(len(lossPcts))
 	}
 	return m
 }

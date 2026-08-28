@@ -12,12 +12,20 @@ import (
 
 const Version = 1
 
+// UmpCell UMP 拦截器单情境统计（JSON 兼容：数组键转结构体）。
+type UmpCell struct {
+	Key   [3]int `json:"key"` // RSI 桶/距前高桶/波动分位桶
+	Wins  int    `json:"wins"`
+	Total int    `json:"total"`
+}
+
 type Runtime struct {
-	Version     int    `json:"version"`
-	LastCandle  int64  `json:"last_candle"`
-	Trials      int    `json:"trials"`
-	KillTripped bool   `json:"kill_tripped"`
-	KillReason  string `json:"kill_reason"`
+	Version     int       `json:"version"`
+	LastCandle  int64     `json:"last_candle"`
+	Trials      int       `json:"trials"`
+	KillTripped bool      `json:"kill_tripped"`
+	KillReason  string    `json:"kill_reason"`
+	UMP         []UmpCell `json:"ump,omitempty"` // UMP 拦截器统计快照（重启续用）
 }
 
 type Store struct {

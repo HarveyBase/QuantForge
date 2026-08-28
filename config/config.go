@@ -34,6 +34,7 @@ type Config struct {
 	Trading   TradingConfig   `json:"trading"`
 	Risk      RiskConfig      `json:"risk"`
 	Strategy  StrategyConfig  `json:"strategy"`
+	Ump       UmpConfig       `json:"ump"`
 	Dashboard DashboardConfig `json:"dashboard"`
 	DataDir   string          `json:"data_dir"`
 }
@@ -75,6 +76,12 @@ type GridConfig struct {
 	StopOnBreak bool    `json:"stop_on_break"` // 下界打穿停止补格并告警
 }
 
+// UmpConfig UMP 信号拦截器配置（grid 版已过样本外验证 docs/10 §5B；
+// 拦截只减少下单不增加风险，故默认开启）。
+type UmpConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
 type DashboardConfig struct {
 	Enabled bool   `json:"enabled"`
 	Listen  string `json:"listen"` // 默认 127.0.0.1:8080，只绑本机
@@ -108,6 +115,7 @@ func Default() *Config {
 				QtyPerGrid: 0.001, Spacing: "geo", StopOnBreak: true,
 			},
 		},
+		Ump:       UmpConfig{Enabled: true},
 		Dashboard: DashboardConfig{Enabled: true, Listen: "127.0.0.1:8080"},
 		DataDir:   "data",
 	}

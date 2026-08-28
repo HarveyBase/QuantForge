@@ -510,3 +510,76 @@ func mathFloor(v float64) float64 {
 	}
 	return float64(int64(v))
 }
+
+// GetCandlesHistory 分页拉取长历史（/api/v5/market/history-candles，单页 100，after 游标向前翻）。
+// total 为目标根数（>1000 时自动多页合并去重）；返回时间升序、可能含未收盘尾部。
+func (c *Client) GetCandlesHistory(ctx context.Context, symbol, interval string, total int) ([]exchange.Candle, error) {
+	bar, ok := intervalMap[interval]
+	if !ok {
+		return nil, fmt.Errorf("okx: 不支持的 K 线周期 %q", interval)
+	}
+	if total <= 0 {
+		total = 1000
+	}
+	if total > 20000 {
+		total = 20000 // 防误配打爆 API 配额
+	}
+	var collected []exchange.Candle
+	seen := map[string]bool{}
+	// history-candles 用 after=ts 返回"该时间之前"的数据（最新在前）；
+	// 首页不带 after，之后用上一页最旧一根的 OpenTime 作游标。
+	var after int64
+	for len(collected) < total {
+		q := url.Values{"instId": {symbol}, "bar": {bar}, "limit": {"100"}}
+		if after > 0 {
+			q.Set("after", strconv.FormatInt(after, 10))
+		}
+		data, err := c.do(ctx, http.MethodGet, "/api/v5/market/history-candles", q, nil, false)
+		if err != nil {
+			return nil, err
+		}
+		var env struct {
+			Data [][]string `json:"data"`
+		}
+		if err := json.Unmarshal(data, &env); err != nil {
+			return nil, fmt.Errorf("okx: 解析历史 K 线失败: %w", err)
+		}
+		if len(env.Data) == 0 {
+			break // 交易所历史尽头
+		}
+		oldest := int64(1<<62 - 1)
+		for _, row := range env.Data {
+			if len(row) < 6 {
+				continue
+			}
+			ot := toInt64(row[0])
+			key := strconv.FormatInt(ot, 10)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			collected = append(collected, exchange.Candle{
+				Exchange: "okx", Symbol: symbol, Interval: interval,
+				OpenTime: ot, Open: toFloat(row[1]), High: toFloat(row[2]),
+				Low: toFloat(row[3]), Close: toFloat(row[4]), Volume: toFloat(row[5]),
+				Confirmed: len(row) >= 9 && row[8] == "1",
+			})
+			if ot < oldest {
+				oldest = ot
+			}
+		}
+		if oldest == 1<<62-1 || oldest <= 0 {
+			break
+		}
+		after = oldest
+		// 游标未推进（页内全部重复）则终止，防死循环
+		if after == 0 {
+			break
+		}
+	}
+	sort.Slice(collected, func(i, j int) bool { return collected[i].OpenTime < collected[j].OpenTime })
+	if len(collected) > total {
+		collected = collected[len(collected)-total:] // 保最新 total 根
+	}
+	return collected, nil
+}

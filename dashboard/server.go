@@ -19,18 +19,23 @@ import (
 	"github.com/HarveyBase/QuantForge/exchange"
 	"github.com/HarveyBase/QuantForge/grid"
 	"github.com/HarveyBase/QuantForge/portfolio"
+	"github.com/HarveyBase/QuantForge/regime"
+	"github.com/HarveyBase/QuantForge/review"
 	"github.com/HarveyBase/QuantForge/risk"
+	"strconv"
 )
 
 // Server 后台服务。
 type Server struct {
-	Cfg         *config.Config
-	Pf          *portfolio.Portfolio
-	Rk          *risk.Manager
-	Ex          OrderSource
-	Grid        *grid.Grid
-	Snapshots   func() []exchange.Candle // 最近已确认 K 线
-	RunBacktest func(ctx context.Context) (*backtest.Result, error)
+	Cfg           *config.Config
+	Pf            *portfolio.Portfolio
+	Rk            *risk.Manager
+	Ex            OrderSource
+	Grid          *grid.Grid
+	Snapshots     func() []exchange.Candle // 最近已确认 K 线
+	RunBacktest   func(ctx context.Context) (*backtest.Result, error)
+	RecentReviews func(n int) []review.Record // 最近 n 份小时复盘
+	Regime        func() regime.Reading       // 当前市况读数
 
 	mu      sync.Mutex
 	subs    map[chan []byte]struct{}
@@ -77,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/grid", s.auth(s.handleGrid))
 	mux.HandleFunc("POST /api/killswitch", s.auth(s.handleKillSwitch))
 	mux.HandleFunc("POST /api/backtest", s.auth(s.handleBacktest))
+	mux.HandleFunc("GET /api/reviews", s.auth(s.handleReviews))
 	mux.HandleFunc("GET /api/config", s.auth(s.handleConfig))
 	mux.HandleFunc("GET /api/stream", s.auth(s.handleSSE))
 	mux.HandleFunc("GET /", s.handleStatic)
@@ -143,9 +149,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"marks":               marks,
 		"kill_switch":         map[string]any{"tripped": s.Rk.Kill.Tripped(), "reason": s.Rk.Kill.Reason()},
 		"daily_notional_used": s.Rk.DailyNotionalUsed(),
+		"regime":              s.regimeSnapshot(),
 		"risk_limits":         s.Cfg.Risk,
 		"uptime_sec":          int(time.Since(s.started).Seconds()),
 	})
+}
+
+func (s *Server) regimeSnapshot() any {
+	if s.Regime == nil {
+		return nil
+	}
+	return s.Regime()
 }
 
 func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
@@ -234,6 +248,21 @@ func (s *Server) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, res)
+}
+
+// handleReviews 最近小时复盘记录（审计面）。
+func (s *Server) handleReviews(w http.ResponseWriter, r *http.Request) {
+	if s.RecentReviews == nil {
+		writeJSON(w, map[string]any{"reviews": nil})
+		return
+	}
+	n := 10
+	if v := r.URL.Query().Get("n"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p <= 100 {
+			n = p
+		}
+	}
+	writeJSON(w, map[string]any{"reviews": s.RecentReviews(n)})
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {

@@ -53,7 +53,7 @@ func TestEngineBuyHoldMatchesPriceReturn(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 100 → 111：买入持有 ≈ +11%（无成本）
-	want := 10000 * (1 + (111.0/100.0 - 1) * 0.99)
+	want := 10000 * (1 + (111.0/100.0-1)*0.99)
 	if math.Abs(res.Metrics.TotalReturnPct-((want/10000-1)*100)) > 0.5 {
 		t.Fatalf("买入持有收益应≈价格涨幅: %v", res.Metrics.TotalReturnPct)
 	}
@@ -123,7 +123,7 @@ func TestMDDBasedOnEquityCurve(t *testing.T) {
 		{Ts: 3, Equity: 90, Price: 90},
 		{Ts: 4, Equity: 95, Price: 95},
 	}
-	m := computeMetrics(curve, nil, 100, 100, 95)
+	m := ComputeMetrics(curve, nil, 100, 100, 95)
 	if m.MaxDrawdownPct > -25 || m.MaxDrawdownPct < -25.1 {
 		t.Fatalf("MDD 应为 -25%%: %v", m.MaxDrawdownPct)
 	}

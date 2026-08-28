@@ -225,6 +225,13 @@ func (p *Portfolio) Equity() float64 {
 	for _, pos := range p.Positions {
 		e += pos.Qty * p.marks[pos.Symbol]
 	}
+	// 买单冻结的现金仍是权益（挂单未成交期间不得出现权益假性塌陷，
+	// 否则回测 MDD 虚高、实盘当日回撤风控会误触发 Kill Switch）
+	for _, f := range p.freezes {
+		if f.req.Side == exchange.Buy {
+			e += f.req.Price * f.remaining
+		}
+	}
 	return e
 }
 func (p *Portfolio) PositionNotional(symbol string) float64 {

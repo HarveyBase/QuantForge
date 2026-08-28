@@ -455,3 +455,60 @@ func TestHasCreds(t *testing.T) {
 		t.Fatal("完整凭据应为 true")
 	}
 }
+
+func TestGetCandlesHistoryPaginates(t *testing.T) {
+	page := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v5/market/history-candles", func(w http.ResponseWriter, r *http.Request) {
+		after := r.URL.Query().Get("after")
+		page++
+		// 两页：第一页 100 根（ot 200..101 最新在前），第二页 50 根（ot 100..51）
+		var rows [][]string
+		switch page {
+		case 1:
+			if after != "" {
+				t.Errorf("首页不应带 after: %s", after)
+			}
+			for i := 0; i < 100; i++ {
+				ot := 200 - i
+				rows = append(rows, []string{fmt.Sprintf("%d", ot), "1", "1", "1", "1", "1", "0", "0", "1"})
+			}
+		case 2:
+			if after != "101" { // 上一页最旧一根
+				t.Errorf("第二页 after 游标错误: %s", after)
+			}
+			for i := 0; i < 50; i++ {
+				ot := 100 - i
+				rows = append(rows, []string{fmt.Sprintf("%d", ot), "1", "1", "1", "1", "1", "0", "0", "1"})
+			}
+		default:
+			w.Write([]byte(`{"code":"0","data":[]}`)) // 第三页空 → 终止
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": rows})
+	})
+	c := newMockClient(t, mux)
+	cs, err := c.GetCandlesHistory(context.Background(), "BTC-USDT", "1H", 150)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs) != 150 {
+		t.Fatalf("两页合并应 150 根: %d", len(cs))
+	}
+	if cs[0].OpenTime != 51 || cs[149].OpenTime != 200 {
+		// ot=100 与 ot=101 不会重复：第二页从 100 开始（第一页最旧 101）
+		t.Fatalf("升序覆盖 51..200（剔除重复 100/101）: 首=%d 末=%d", cs[0].OpenTime, cs[149].OpenTime)
+	}
+	for i := 1; i < len(cs); i++ {
+		if cs[i].OpenTime <= cs[i-1].OpenTime {
+			t.Fatal("必须升序且无重复")
+		}
+	}
+}
+
+func TestGetCandlesHistoryClamps(t *testing.T) {
+	c := newMockClient(t, http.NewServeMux())
+	if _, err := c.GetCandlesHistory(context.Background(), "BTC-USDT", "7x", 100); err == nil {
+		t.Fatal("非法周期必须报错")
+	}
+}

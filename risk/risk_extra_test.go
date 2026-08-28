@@ -255,3 +255,13 @@ func TestCheckOrderFuzzNoPanic(t *testing.T) {
 		_ = m.CheckOrder(req, r.Float64()*1e5)
 	}
 }
+
+func TestRejectionsCapped(t *testing.T) {
+	m := NewManager(testLimits(), portfolio.New(100000), "")
+	for i := 0; i < maxRejections+500; i++ {
+		_ = m.CheckOrder(buyReq(1, 100000), 100000) // 必然拒单（敞口超限）
+	}
+	if rs := m.Rejections(); len(rs) != maxRejections {
+		t.Fatalf("内存台账应封顶 %d: %d", maxRejections, len(rs))
+	}
+}

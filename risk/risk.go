@@ -217,9 +217,15 @@ func (m *Manager) ReconcileBlocked() (bool, string) {
 	return m.reconcileBlocked, m.reconcileReason
 }
 
+// maxRejections 内存台账上限：超过后丢弃最旧（完整记录已落盘 ledger.jsonl，内存只留最近窗口）。
+const maxRejections = 10000
+
 func (m *Manager) reject(req exchange.OrderRequest, ruleID, format string, args ...any) error {
 	r := Rejection{Ts: time.Now().UTC(), RuleID: ruleID, Reason: fmt.Sprintf(format, args...), Order: req}
 	m.rejections = append(m.rejections, r)
+	if len(m.rejections) > maxRejections {
+		m.rejections = m.rejections[len(m.rejections)-maxRejections:]
+	}
 	if m.ledgerPath != "" {
 		if b, err := json.Marshal(r); err == nil {
 			if f, err := os.OpenFile(m.ledgerPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {

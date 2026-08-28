@@ -54,3 +54,7 @@ web/tsconfig.tsbuildinfo
 
 # 本机工具权限配置不入库（agents 角色定义保留）
 .claude/settings.local.json
+
+# 复盘归档与运行态（review/state 包运行时产物）
+data/reviews/
+data/state/

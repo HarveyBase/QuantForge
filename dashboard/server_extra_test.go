@@ -15,6 +15,7 @@ import (
 	"github.com/HarveyBase/QuantForge/exchange"
 	"github.com/HarveyBase/QuantForge/grid"
 	"github.com/HarveyBase/QuantForge/portfolio"
+	"github.com/HarveyBase/QuantForge/review"
 	"github.com/HarveyBase/QuantForge/risk"
 )
 
@@ -321,4 +322,32 @@ func newServerWithCfg(t *testing.T, cfg *config.Config) *Server {
 	pf := portfolio.New(10000)
 	rk := risk.NewManager(risk.Limits{MaxOrdersPerMinute: 10, MaxDailyLossPct: 5}, pf, "")
 	return New(cfg, pf, rk, NoopExecutor{}, nil, nil, nil)
+}
+
+func TestReviewsEndpoint(t *testing.T) {
+	s := newServerForTest(t)
+	s.RecentReviews = func(n int) []review.Record {
+		return []review.Record{{Stage: "paper", Symbol: "BTC-USDT"}}
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/reviews")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Reviews []review.Record `json:"reviews"`
+	}
+	json.NewDecoder(resp.Body).Decode(&body)
+	if len(body.Reviews) != 1 || body.Reviews[0].Symbol != "BTC-USDT" {
+		t.Fatalf("复盘端点应透传记录: %+v", body.Reviews)
+	}
+	// nil 注入安全
+	s.RecentReviews = nil
+	resp2, _ := http.Get(srv.URL + "/api/reviews")
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Fatalf("nil 注入应安全: %d", resp2.StatusCode)
+	}
 }

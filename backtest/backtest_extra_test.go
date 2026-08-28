@@ -213,12 +213,12 @@ func (s *sellMarketOnce) OnCandle(ctx *strategy.Context) []strategy.OrderIntent 
 
 func TestComputeMetricsEdgeCases(t *testing.T) {
 	// 空曲线
-	m := computeMetrics(nil, nil, 100, 100, 100)
+	m := ComputeMetrics(nil, nil, 100, 100, 100)
 	if m.FinalEquity != 100 {
 		t.Fatalf("空曲线返回种子资金: %v", m.FinalEquity)
 	}
 	// 单点曲线：无 MDD/Sharpe
-	m = computeMetrics([]EquityPoint{{Ts: 1, Equity: 100}}, nil, 100, 100, 100)
+	m = ComputeMetrics([]EquityPoint{{Ts: 1, Equity: 100}}, nil, 100, 100, 100)
 	if m.MaxDrawdownPct != 0 || m.Sharpe != 0 || m.TotalReturnPct != 0 {
 		t.Fatalf("单点曲线指标应退化为零: %+v", m)
 	}
@@ -229,7 +229,7 @@ func TestComputeMetricsEdgeCases(t *testing.T) {
 		{Side: exchange.Buy, AvgPrice: 105, FilledQty: 1, Fee: -1},
 		{Side: exchange.Sell, AvgPrice: 100, FilledQty: 1, Fee: -1},
 	}
-	m = computeMetrics([]EquityPoint{{Ts: 1, Equity: 100}, {Ts: 2, Equity: 101}}, trades, 100, 100, 101)
+	m = ComputeMetrics([]EquityPoint{{Ts: 1, Equity: 100}, {Ts: 2, Equity: 101}}, trades, 100, 100, 101)
 	if m.WinRate != 50 {
 		t.Fatalf("胜率应为 50%%: %v", m.WinRate)
 	}
@@ -249,7 +249,7 @@ func TestComputeMetricsSharpeAnnualizes(t *testing.T) {
 		{Ts: 10_800_000, Equity: 103},
 		{Ts: 14_400_000, Equity: 102},
 	}
-	m := computeMetrics(curve, nil, 100, 100, 102)
+	m := ComputeMetrics(curve, nil, 100, 100, 102)
 	if m.Sharpe <= 0 {
 		t.Fatalf("正收益序列 Sharpe 应为正: %v", m.Sharpe)
 	}
