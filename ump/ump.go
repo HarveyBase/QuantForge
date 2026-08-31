@@ -189,13 +189,14 @@ func (f *Filter) Total() int {
 
 // OOSReport 拦截器自身的样本外验证结果（时间对半：前半训练、后半测试）。
 type OOSReport struct {
-	TrainSamples, TestSamples int
-	Blocked                   int     // 测试集中被拦截的笔数
-	TestWinRateBefore         float64 // 测试集全量胜率
-	TestWinRateAfter          float64 // 测试集放行（未被拦截）胜率
-	Improvement               float64 // after − before
-	Usable                    bool    // 拦截器是否可用（提升 > 0 且拦截数 > 0）
-	Reason                    string
+	TrainSamples      int     `json:"train_samples"`
+	TestSamples       int     `json:"test_samples"`
+	Blocked           int     `json:"blocked"`              // 测试集中被拦截的笔数
+	TestWinRateBefore float64 `json:"test_win_rate_before"` // 测试集全量胜率
+	TestWinRateAfter  float64 `json:"test_win_rate_after"`  // 测试集放行（未被拦截）胜率
+	Improvement       float64 `json:"improvement"`          // after − before
+	Usable            bool    `json:"usable"`               // 拦截器是否可用（提升 > 0 且拦截数 > 0）
+	Reason            string  `json:"reason"`
 }
 
 // ValidateOOS 时间对半验证拦截器：train 建统计，test 上模拟"启用拦截"的效果。

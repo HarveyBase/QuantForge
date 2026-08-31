@@ -535,6 +535,66 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 	runBacktest := func(ctx context.Context) (*backtest.Result, error) {
 		return a.runBacktest(ctx)
 	}
+	runWF := func(ctx context.Context, strategyName string, train, test int) (*lab.WFReport, error) {
+		if strategyName == "" {
+			strategyName = "trend"
+		}
+		candles := a.fetchCandles(ctx, train+test)
+		if len(candles) < train+test {
+			return nil, fmt.Errorf("样本 %d 根不足 train+test=%d（先 fetch 长历史）", len(candles), train+test)
+		}
+		var selector lab.StrategySelector
+		switch strategyName {
+		case "trend":
+			selector = lab.FixedSelector(func() strategy.Strategy {
+				s, _ := trend.New(trend.Params{
+					EntryN: a.cfg.Strategy.Trend.EntryN, ExitN: a.cfg.Strategy.Trend.ExitN,
+					AtrN: a.cfg.Strategy.Trend.AtrN, AtrMult: a.cfg.Strategy.Trend.AtrMult,
+					RiskPct: a.cfg.Strategy.Trend.RiskPct, MaxPosPct: a.cfg.Strategy.Trend.MaxPosPct,
+				})
+				return s
+			}, fmt.Sprintf("trend:%dx%d", a.cfg.Strategy.Trend.EntryN, a.cfg.Strategy.Trend.ExitN))
+		case "grid":
+			selector = lab.FixedSelector(func() strategy.Strategy { return a.grid }, "grid:config")
+		default:
+			return nil, fmt.Errorf("未知策略 %q（支持 trend / grid）", strategyName)
+		}
+		return lab.WalkForward(candles, lab.WFConfig{
+			TrainBars: train, TestBars: test, SeedCash: 10000,
+			Cost:   backtest.CostModel{SlippageBps: a.cfg.Trading.SlippageBps, MakerFeeBps: 2, TakerFeeBps: 5},
+			Symbol: a.cfg.Exchange.InstID, Interval: a.cfg.Trading.Interval,
+		}, selector)
+	}
+	runUMP := func(ctx context.Context, strategyName string, minSamples int) (int, *ump.OOSReport, error) {
+		if strategyName == "" {
+			strategyName = "grid"
+		}
+		if minSamples <= 0 {
+			minSamples = ump.DefaultMinSamples
+		}
+		candles := a.fetchCandles(ctx, 400)
+		if len(candles) < 300 {
+			return 0, nil, fmt.Errorf("样本 %d 根不足 300", len(candles))
+		}
+		var mk func() strategy.Strategy
+		switch strategyName {
+		case "trend":
+			mk = func() strategy.Strategy {
+				s, _ := trend.New(trend.Params{
+					EntryN: a.cfg.Strategy.Trend.EntryN, ExitN: a.cfg.Strategy.Trend.ExitN,
+					AtrN: a.cfg.Strategy.Trend.AtrN, AtrMult: a.cfg.Strategy.Trend.AtrMult,
+					RiskPct: a.cfg.Strategy.Trend.RiskPct, MaxPosPct: a.cfg.Strategy.Trend.MaxPosPct,
+				})
+				return s
+			}
+		case "grid":
+			mk = func() strategy.Strategy { return a.grid }
+		default:
+			return 0, nil, fmt.Errorf("未知策略 %q", strategyName)
+		}
+		return lab.UMPCheck(candles, backtest.CostModel{SlippageBps: a.cfg.Trading.SlippageBps, MakerFeeBps: 2, TakerFeeBps: 5},
+			10000, a.cfg.Exchange.InstID, a.cfg.Trading.Interval, mk, ump.DefaultMinWinRate, minSamples)
+	}
 	var orderSrc dashboard.OrderSource = dashboard.NoopExecutor{}
 	if a.exec != nil {
 		orderSrc = a.exec
@@ -545,6 +605,8 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 		return append([]exchange.Candle(nil), a.candles...)
 	}, runBacktest)
 	srv.RecentReviews = a.reviewer.Recent
+	srv.RunWalkForward = runWF
+	srv.RunUMPCheck = runUMP
 	srv.CurrentStrategy = a.CurrentStrategy
 	srv.SwitchStrategy = a.SwitchStrategy
 	srv.Fills = func() []execution.Event {

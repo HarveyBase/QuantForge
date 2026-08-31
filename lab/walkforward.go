@@ -24,23 +24,25 @@ type WFConfig struct {
 
 // FoldResult 单折结果：训练窗上选出的策略描述 + 测试窗（样本外）表现。
 type FoldResult struct {
-	TrainFrom, TrainTo int64 // 训练窗 [from, to)（ms，to 为开区间根的 OpenTime）
-	TestFrom, TestTo   int64
-	Strategy           string // 本折选出的策略描述（参数留痕）
-	Fold               int    // 折序号
-	backtest.Metrics          // 测试窗指标
-	RiskRejections     int
+	TrainFrom        int64  `json:"train_from_ms"` // 训练窗（ms）
+	TrainTo          int64  `json:"train_to_ms"`
+	TestFrom         int64  `json:"test_from_ms"`
+	TestTo           int64  `json:"test_to_ms"`
+	Strategy         string `json:"strategy"` // 本折选出的策略描述（参数留痕）
+	Fold             int    `json:"fold"`
+	backtest.Metrics        // 测试窗指标
+	RiskRejections   int
 }
 
 // WFReport walk-forward 总报告。
 type WFReport struct {
-	Folds               []FoldResult
-	OOSMetrics          backtest.Metrics       // 样本外拼接曲线复算
-	OOSCurve            []backtest.EquityPoint // 样本外拼接权益曲线（复合归一）
-	BuyHoldPct          float64                // 同区间买入持有对照
-	TotalTrials         int                    // 全部试验数（含训练窗搜索）
-	Candles             int
-	TrainBars, TestBars int
+	Folds               []FoldResult           `json:"folds"`
+	OOSMetrics          backtest.Metrics       `json:"oos_metrics"`  // 样本外拼接曲线复算
+	OOSCurve            []backtest.EquityPoint `json:"oos_curve"`    // 复合归一
+	BuyHoldPct          float64                `json:"buy_hold_pct"` // 同区间买入持有对照
+	TotalTrials         int                    `json:"total_trials"` // 全部试验数（含训练窗搜索）
+	Candles             int                    `json:"candles"`
+	TrainBars, TestBars int                    `json:",omitempty"`
 }
 
 // StrategySelector 在训练窗上产出要上测试窗的策略。

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, streamURL } from './api'
-import type { FillEvent, ModeInfo, ReviewRecord } from './api'
+import type { FillEvent, ModeInfo, ReviewRecord, WFReport } from './api'
 import type { BacktestResult, Candle, GridStats, Order, Rejection } from './types'
 
 declare global {
@@ -57,6 +57,14 @@ export default function App() {
   const modeInfo = usePolling(api.mode, 5000)
   const strategyInfo = usePolling(api.strategy, 8000)
   const [stratMsg, setStratMsg] = useState('')
+  const [rsStrategy, setRsStrategy] = useState('trend')
+  const [rsTrain, setRsTrain] = useState('300')
+  const [rsTest, setRsTest] = useState('100')
+  const [wf, setWf] = useState<WFReport | null>(null)
+  const [wfRunning, setWfRunning] = useState(false)
+  const [wfErr, setWfErr] = useState('')
+  const [umpRes, setUmpRes] = useState<{ trade_samples: number; report: { usable: boolean; reason: string } } | null>(null)
+  const [umpRunning, setUmpRunning] = useState(false)
   const [modeMsg, setModeMsg] = useState('')
   const reviews = usePolling(() => api.reviews(5), 15000)
   const fills = usePolling(api.fills, 5000)
@@ -113,6 +121,35 @@ export default function App() {
       await api.cancelOrder(orderId)
     } catch (e) {
       window.__lastCancelErr = String(e)
+    }
+  }
+
+  const runWF = async () => {
+    setWfRunning(true)
+    setWfErr('')
+    setWf(null)
+    try {
+      setWf(await api.researchWF({
+        strategy: rsStrategy,
+        train: parseInt(rsTrain) || 300,
+        test: parseInt(rsTest) || 100,
+      }))
+    } catch (e) {
+      setWfErr(String(e).replace('Error: ', ''))
+    } finally {
+      setWfRunning(false)
+    }
+  }
+
+  const runUMP = async () => {
+    setUmpRunning(true)
+    setUmpRes(null)
+    try {
+      setUmpRes(await api.researchUMP({ strategy: rsStrategy }))
+    } catch (e) {
+      setUmpRes({ trade_samples: 0, report: { usable: false, reason: String(e).replace('Error: ', '') } })
+    } finally {
+      setUmpRunning(false)
     }
   }
 
@@ -464,6 +501,61 @@ export default function App() {
           ) : (
             <div className="sub">尚未运行</div>
           )}
+        </Card>
+      </section>
+
+      <section className="wide">
+        <Card
+          title="研究工作台（lab 验证流水线）"
+          action={
+            <div className="manual-grid" style={{ gridTemplateColumns: 'auto 100px 100px auto auto' }}>
+              <select value={rsStrategy} onChange={(e) => setRsStrategy(e.target.value)}>
+                <option value="trend">trend</option>
+                <option value="grid">grid</option>
+              </select>
+              <input placeholder="train" value={rsTrain} onChange={(e) => setRsTrain(e.target.value)} />
+              <input placeholder="test" value={rsTest} onChange={(e) => setRsTest(e.target.value)} />
+              <button onClick={runWF} disabled={wfRunning}>{wfRunning ? 'WF 运行中…' : '跑 walk-forward'}</button>
+              <button onClick={runUMP} disabled={umpRunning}>{umpRunning ? 'UMP 验证中…' : 'UMP 拦截器验证'}</button>
+            </div>
+          }
+        >
+          {wfErr && <div className="sub warn">{wfErr}</div>}
+          {wf && (
+            <>
+              <ul className="kv grid2">
+                <li>样本: {wf.candles} 根</li>
+                <li>试验: {wf.total_trials} 次</li>
+                <li>OOS 收益: {fmt(wf.oos_metrics.total_return_pct)}%</li>
+                <li>OOS MDD: {fmt(wf.oos_metrics.max_drawdown_pct)}%</li>
+                <li>Calmar: {fmt(wf.oos_metrics.calmar)}</li>
+                <li>买入持有: {fmt(wf.buy_hold_pct)}%</li>
+              </ul>
+              <table>
+                <thead>
+                  <tr><th>折</th><th>策略</th><th>收益</th><th>MDD</th><th>交易</th></tr>
+                </thead>
+                <tbody>
+                  {wf.folds.slice(-10).map((f) => (
+                    <tr key={f.fold}>
+                      <td>{f.fold}</td>
+                      <td>{f.strategy}</td>
+                      <td className={f.total_return_pct >= 0 ? 'up' : 'down'}>{f.total_return_pct.toFixed(2)}%</td>
+                      <td>{f.max_drawdown_pct.toFixed(2)}%</td>
+                      <td>{f.trade_count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="sub warn">OOS 不代表实盘收益；结论口径见 docs/01、docs/02</div>
+            </>
+          )}
+          {umpRes && (
+            <div className={umpRes.report.usable ? 'sub up' : 'sub warn'}>
+              UMP（{umpRes.trade_samples} 笔样本）：{umpRes.report.reason}
+            </div>
+          )}
+          {!wf && !umpRes && !wfErr && <div className="sub">walk-forward 样本外验证与 UMP 拦截器验证（需先 fetch 长历史）</div>}
         </Card>
       </section>
     </div>

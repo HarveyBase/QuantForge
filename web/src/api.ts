@@ -67,6 +67,29 @@ export const api = {
   strategy: () =>
     get<{ name: string; desc: string; available: string[] }>('/api/strategy'),
   switchStrategy: (name: string) => post('/api/strategy', { name }),
+  researchWF: (o: { strategy: string; train: number; test: number }) =>
+    post<WFReport>('/api/research/walkforward', o),
+  researchUMP: (o: { strategy: string }) =>
+    post<{ trade_samples: number; report: { usable: boolean; reason: string } }>(
+      '/api/research/umpcheck',
+      o,
+    ),
+}
+
+export interface WFReport {
+  folds: {
+    fold: number
+    test_from: number
+    test_to: number
+    strategy: string
+    total_return_pct: number
+    max_drawdown_pct: number
+    trade_count: number
+  }[]
+  oos_metrics: { total_return_pct: number; max_drawdown_pct: number; calmar: number }
+  buy_hold_pct: number
+  total_trials: number
+  candles: number
 }
 
 export interface FillEvent {

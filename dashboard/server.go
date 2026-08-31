@@ -19,10 +19,12 @@ import (
 	"github.com/HarveyBase/QuantForge/exchange"
 	"github.com/HarveyBase/QuantForge/execution"
 	"github.com/HarveyBase/QuantForge/grid"
+	"github.com/HarveyBase/QuantForge/lab"
 	"github.com/HarveyBase/QuantForge/portfolio"
 	"github.com/HarveyBase/QuantForge/regime"
 	"github.com/HarveyBase/QuantForge/review"
 	"github.com/HarveyBase/QuantForge/risk"
+	"github.com/HarveyBase/QuantForge/ump"
 	"strconv"
 )
 
@@ -36,14 +38,16 @@ type Server struct {
 	Snapshots       func() []exchange.Candle                           // 最近已确认 K 线
 	Candles         func(interval string, limit int) []exchange.Candle // SQLite 库读取（任意周期/全历史）
 	RunBacktest     func(ctx context.Context) (*backtest.Result, error)
-	RecentReviews   func(n int) []review.Record                                                  // 最近 n 份小时复盘
-	Regime          func() regime.Reading                                                        // 当前市况读数
-	CurrentStrategy func() string                                                                // 当前策略描述
-	SwitchStrategy  func(name string) error                                                      // 热切策略（无持仓才允许）
-	Fills           func() []execution.Event                                                     // 成交历史（事件流过滤）
-	EquityCurve     func() []review.Record                                                       // 权益曲线数据源（复盘记录聚合）
-	CancelOrder     func(ctx context.Context, id string) error                                   // 手动撤单
-	PlaceOrder      func(ctx context.Context, req exchange.OrderRequest) (exchange.Order, error) // 手动下单（走风控）
+	RunWalkForward  func(ctx context.Context, strategyName string, train, test int) (*lab.WFReport, error)      // 研究工作台：WF
+	RunUMPCheck     func(ctx context.Context, strategyName string, minSamples int) (int, *ump.OOSReport, error) // 研究工作台：UMP
+	RecentReviews   func(n int) []review.Record                                                                 // 最近 n 份小时复盘
+	Regime          func() regime.Reading                                                                       // 当前市况读数
+	CurrentStrategy func() string                                                                               // 当前策略描述
+	SwitchStrategy  func(name string) error                                                                     // 热切策略（无持仓才允许）
+	Fills           func() []execution.Event                                                                    // 成交历史（事件流过滤）
+	EquityCurve     func() []review.Record                                                                      // 权益曲线数据源（复盘记录聚合）
+	CancelOrder     func(ctx context.Context, id string) error                                                  // 手动撤单
+	PlaceOrder      func(ctx context.Context, req exchange.OrderRequest) (exchange.Order, error)                // 手动下单（走风控）
 	// ModeSwap 页面热切活跃环境（research↔paper；live 受启动配置门禁，见 cmd.SwitchMode）
 	ActiveMode func() config.Mode // 当前活跃环境
 	BootMode   config.Mode        // 启动配置环境（能力上界）
@@ -99,6 +103,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/reviews", s.auth(s.handleReviews))
 	mux.HandleFunc("GET /api/strategy", s.auth(s.handleGetStrategy))
 	mux.HandleFunc("POST /api/strategy", s.auth(s.handleSwitchStrategy))
+	mux.HandleFunc("POST /api/research/walkforward", s.auth(s.handleResearchWF))
+	mux.HandleFunc("POST /api/research/umpcheck", s.auth(s.handleResearchUMP))
 	mux.HandleFunc("GET /api/fills", s.auth(s.handleFills))
 	mux.HandleFunc("GET /api/equitycurve", s.auth(s.handleEquityCurve))
 	mux.HandleFunc("POST /api/cancel", s.auth(s.handleCancel))
@@ -390,6 +396,59 @@ func (s *Server) handleSwitchStrategy(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Broadcast("strategy_switch", map[string]any{"name": req.Name})
 	writeJSON(w, map[string]any{"switched": req.Name})
+}
+
+// handleResearchWF 研究工作台：walk-forward 样本外验证。
+func (s *Server) handleResearchWF(w http.ResponseWriter, r *http.Request) {
+	if s.RunWalkForward == nil {
+		http.Error(w, "未配置研究数据源", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Strategy string `json:"strategy"`
+		Train    int    `json:"train"`
+		Test     int    `json:"test"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "请求体非法", http.StatusBadRequest)
+		return
+	}
+	if req.Train <= 0 || req.Test <= 0 || req.Train > 5000 || req.Test > 2000 {
+		http.Error(w, "train/test 越界（train≤5000, test≤2000）", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	rep, err := s.RunWalkForward(ctx, req.Strategy, req.Train, req.Test)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, rep)
+}
+
+// handleResearchUMP 研究工作台：UMP 拦截器样本外验证。
+func (s *Server) handleResearchUMP(w http.ResponseWriter, r *http.Request) {
+	if s.RunUMPCheck == nil {
+		http.Error(w, "未配置研究数据源", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Strategy   string `json:"strategy"`
+		MinSamples int    `json:"min_samples"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "请求体非法", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	n, rep, err := s.RunUMPCheck(ctx, req.Strategy, req.MinSamples)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"trade_samples": n, "report": rep})
 }
 
 // handleFills 成交历史（最近 200 条成交事件）。
