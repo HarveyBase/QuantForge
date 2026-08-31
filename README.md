@@ -63,3 +63,18 @@ cp config.example.json config.json
 go test ./...
 cd web && npm run build
 ```
+
+## 运行
+
+```bash
+# 本地
+go build -o quantforge ./cmd/quantforge && ./quantforge serve -config config.json
+
+# Docker（配置放 /data/config.json，密钥走环境变量）
+docker build -t quantforge .
+docker run -v $PWD/data:/data -p 8080:8080 quantforge
+```
+
+环境变量：`OKX_API_KEY/OKX_SECRET/OKX_PASSPHRASE`（交易）、
+`TG_BOT_TOKEN/TG_CHAT_ID`（告警）、`QUANTFORGE_ALLOW_LIVE`（实盘门禁）、
+`https_proxy`（网络受限环境）。

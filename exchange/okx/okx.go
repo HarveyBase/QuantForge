@@ -513,7 +513,18 @@ func mathFloor(v float64) float64 {
 
 // GetCandlesHistory 分页拉取长历史（/api/v5/market/history-candles，单页 100，after 游标向前翻）。
 // total 为目标根数（>1000 时自动多页合并去重）；返回时间升序、可能含未收盘尾部。
+// AfterOpenTime 非零时只拉该时间之前的数据（断点续拉：传入库中最老一根的 OpenTime）。
+// OnPage 非空时每页回调（增量持久化：中断不丢已拉数据），回调出错即中止。
 func (c *Client) GetCandlesHistory(ctx context.Context, symbol, interval string, total int) ([]exchange.Candle, error) {
+	return c.getCandlesHistory(ctx, symbol, interval, total, 0, nil)
+}
+
+// GetCandlesHistoryFrom 断点续拉：从 afterFrom（该 OpenTime 之前）拉到历史尽头，每页回调。
+func (c *Client) GetCandlesHistoryFrom(ctx context.Context, symbol, interval string, afterFrom int64, onPage func([]exchange.Candle) error) ([]exchange.Candle, error) {
+	return c.getCandlesHistory(ctx, symbol, interval, 0, afterFrom, onPage)
+}
+
+func (c *Client) getCandlesHistory(ctx context.Context, symbol, interval string, total int, afterFrom int64, onPage func([]exchange.Candle) error) ([]exchange.Candle, error) {
 	bar, ok := intervalMap[interval]
 	if !ok {
 		return nil, fmt.Errorf("okx: 不支持的 K 线周期 %q", interval)
@@ -527,8 +538,11 @@ func (c *Client) GetCandlesHistory(ctx context.Context, symbol, interval string,
 	var collected []exchange.Candle
 	seen := map[string]bool{}
 	// history-candles 用 after=ts 返回"该时间之前"的数据（最新在前）；
-	// 首页不带 after，之后用上一页最旧一根的 OpenTime 作游标。
-	var after int64
+	// 首页不带 after（断点续拉时带），之后用上一页最旧一根的 OpenTime 作游标。
+	var after int64 = afterFrom
+	if afterFrom > 0 {
+		total = 1 << 30 // 续拉模式：拉到历史尽头
+	}
 	for len(collected) < total {
 		q := url.Values{"instId": {symbol}, "bar": {bar}, "limit": {"100"}}
 		if after > 0 {
@@ -546,6 +560,27 @@ func (c *Client) GetCandlesHistory(ctx context.Context, symbol, interval string,
 		}
 		if len(env.Data) == 0 {
 			break // 交易所历史尽头
+		}
+		if onPage != nil {
+			var page []exchange.Candle
+			for _, row := range env.Data {
+				if len(row) < 6 {
+					continue
+				}
+				ot := toInt64(row[0])
+				if seen[strconv.FormatInt(ot, 10)] {
+					continue
+				}
+				page = append(page, exchange.Candle{
+					Exchange: "okx", Symbol: symbol, Interval: interval,
+					OpenTime: ot, Open: toFloat(row[1]), High: toFloat(row[2]),
+					Low: toFloat(row[3]), Close: toFloat(row[4]), Volume: toFloat(row[5]),
+					Confirmed: len(row) >= 9 && row[8] == "1",
+				})
+			}
+			if len(page) > 0 && onPage(page) != nil {
+				return nil, fmt.Errorf("okx: 分页持久化回调失败")
+			}
 		}
 		oldest := int64(1<<62 - 1)
 		for _, row := range env.Data {

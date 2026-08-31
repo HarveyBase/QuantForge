@@ -999,14 +999,31 @@ func cmdFetch(args []string) error {
 	if !ok {
 		return fmt.Errorf("fetch 需要 okx 适配器（当前 %s）", a.ex.Name())
 	}
-	// 超时按拉取量估算：每页 100 根、限频 10 页/秒 × 3 倍网络余量，下限 5 分钟
-	timeout := time.Duration(*bars/100) * 300 * time.Millisecond
+	// 超时按拉取量估算：远古分页明显变慢（OKX history 对 2018-2019 段限流严格），
+	// 每页按 2s 预算；中断不丢数据（每页增量入 SQLite，重跑自动续拉）。
+	timeout := time.Duration(*bars/100) * 2 * time.Second
 	if timeout < 5*time.Minute {
 		timeout = 5 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	raw, err := client.GetCandlesHistory(ctx, cfg.Exchange.InstID, cfg.Trading.Interval, *bars)
+	db, derr := candlestore.Open(cfg.DataDir)
+	if derr != nil {
+		return fmt.Errorf("K 线库打开失败: %w", derr)
+	}
+	defer db.Close()
+	// 断点续拉：库中已有部分数据且不足目标时，从最老一根继续向历史方向拉
+	var afterFrom int64
+	if existing, err := db.Latest(cfg.Exchange.Name, cfg.Exchange.InstID, cfg.Trading.Interval, 1<<30); err == nil && len(existing) > 0 && len(existing) < *bars {
+		afterFrom = existing[0].OpenTime
+		if afterFrom > 0 {
+			fmt.Printf("断点续拉：库中已有 %d 根，从 %s 继续向历史方向拉取\n",
+				len(existing), time.UnixMilli(afterFrom).Format("2006-01-02 15:04"))
+		}
+	}
+	raw, err := client.GetCandlesHistoryFrom(ctx, cfg.Exchange.InstID, cfg.Trading.Interval, afterFrom, func(page []exchange.Candle) error {
+		return db.Upsert(page)
+	})
 	if err != nil {
 		return fmt.Errorf("历史拉取失败: %w", err)
 	}
@@ -1025,14 +1042,11 @@ func cmdFetch(args []string) error {
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		return err
 	}
-	// 同步入库 SQLite 缓存库（图表/回测统一数据面）
-	if db, derr := candlestore.Open(cfg.DataDir); derr == nil {
-		if uerr := db.Upsert(clean); uerr != nil {
-			log.Printf("fetch 入库失败: %v", uerr)
-		} else if n, _ := db.Count("okx", cfg.Exchange.InstID, cfg.Trading.Interval); n > 0 {
-			fmt.Printf("已入库 SQLite：%d 根 %s K 线（data/candles.db）\n", n, cfg.Trading.Interval)
-		}
-		db.Close()
+	if n, _ := db.Count(cfg.Exchange.Name, cfg.Exchange.InstID, cfg.Trading.Interval); n > 0 {
+		fmt.Printf("库中累计：%d 根 %s K 线（data/candles.db）\n", n, cfg.Trading.Interval)
+	}
+	if len(clean) == 0 {
+		return nil
 	}
 	first, last := clean[0], clean[len(clean)-1]
 	fmt.Printf("已固化 %d 根 %s K 线到 %s\n区间: %s ~ %s\n",
