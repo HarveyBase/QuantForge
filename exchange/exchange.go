@@ -154,6 +154,39 @@ func (o Order) Notional() float64 {
 	return p * o.Qty
 }
 
+// OrderBookLevel 盘口档位（价格、数量）。
+type OrderBookLevel struct {
+	Price float64 `json:"price"`
+	Qty   float64 `json:"qty"`
+}
+
+// OrderBook 盘口深度（供网格 spread 检查与滑点模型输入）。
+type OrderBook struct {
+	Symbol string           `json:"symbol"`
+	Bids   []OrderBookLevel `json:"bids"` // 按价格降序
+	Asks   []OrderBookLevel `json:"asks"` // 按价格升序
+	Ts     int64            `json:"ts"`
+}
+
+// SpreadBp 买卖价差（基点）：最优买一卖一。
+func (b OrderBook) SpreadBp() float64 {
+	if len(b.Bids) == 0 || len(b.Asks) == 0 {
+		return 0
+	}
+	return (b.Asks[0].Price - b.Bids[0].Price) / ((b.Asks[0].Price + b.Bids[0].Price) / 2) * 10000
+}
+
+// DepthNotional 前 n 档名义合计（流动性评估：滑点模型的输入）。
+func (b OrderBook) DepthNotional(levels int) (bid, ask float64) {
+	for i := 0; i < levels && i < len(b.Bids); i++ {
+		bid += b.Bids[i].Price * b.Bids[i].Qty
+	}
+	for i := 0; i < levels && i < len(b.Asks); i++ {
+		ask += b.Asks[i].Price * b.Asks[i].Qty
+	}
+	return
+}
+
 // Fill 单笔增量成交。Price/Fee 均为本次增量口径，不是订单累计值。
 type Fill struct {
 	Symbol        string  `json:"symbol"`
@@ -182,6 +215,7 @@ type Exchange interface {
 	GetCandles(ctx context.Context, symbol, interval string, limit int) ([]Candle, error)
 	GetTicker(ctx context.Context, symbol string) (Ticker, error)
 	GetInstrument(ctx context.Context, instID string) (Instrument, error)
+	GetOrderBook(ctx context.Context, symbol string, depth int) (OrderBook, error)
 
 	// 交易（需要 API Key；paper 模式用 OKX demo trading）
 	GetBalances(ctx context.Context) ([]Balance, error)

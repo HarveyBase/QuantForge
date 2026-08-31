@@ -60,6 +60,25 @@ func (e *Exchange) GetTicker(ctx context.Context, symbol string) (exchange.Ticke
 	return exchange.Ticker{Symbol: symbol, Last: e.last, Bid: e.last - half, Ask: e.last + half, Ts: e.nowFn()}, nil
 }
 
+// GetOrderBook 本地合成盘口：围绕 last 对称各 10 档（每档 0.5 个最小变动、1 BTC）。
+func (e *Exchange) GetOrderBook(ctx context.Context, symbol string, depth int) (exchange.OrderBook, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.last <= 0 {
+		return exchange.OrderBook{}, fmt.Errorf("paper: 价格未初始化")
+	}
+	if depth <= 0 || depth > 10 {
+		depth = 10
+	}
+	ob := exchange.OrderBook{Symbol: symbol, Ts: e.nowFn()}
+	step := e.last * 0.0001
+	for i := 0; i < depth; i++ {
+		ob.Bids = append(ob.Bids, exchange.OrderBookLevel{Price: e.last - step*float64(i+1), Qty: 1})
+		ob.Asks = append(ob.Asks, exchange.OrderBookLevel{Price: e.last + step*float64(i+1), Qty: 1})
+	}
+	return ob, nil
+}
+
 func (e *Exchange) GetInstrument(ctx context.Context, instID string) (exchange.Instrument, error) {
 	return exchange.Instrument{
 		Exchange: e.Name(), InstID: instID, Market: exchange.MarketSPOT,

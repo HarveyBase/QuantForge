@@ -15,6 +15,18 @@ try {
 } catch {
   token = ''
 }
+
+export const auth = {
+  current: () => token,
+  save: (t: string) => {
+    token = t
+    try {
+      localStorage.setItem('quantforge_token', t)
+    } catch {
+      /* 无 localStorage 环境 */
+    }
+  },
+}
 const authHeaders = (): Record<string, string> =>
   token ? { Authorization: `Bearer ${token}` } : {}
 

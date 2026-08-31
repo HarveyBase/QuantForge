@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, streamURL } from './api'
+import { api, auth, streamURL } from './api'
 import type { FillEvent, ModeInfo, ReviewRecord, WFReport } from './api'
 import type { BacktestResult, Candle, GridStats, Order, Rejection } from './types'
 
@@ -43,6 +43,15 @@ function usePolling<T>(fetcher: () => Promise<T>, intervalMs: number): T | null 
 
 export default function App() {
   const status = usePolling(api.status, 2000)
+  // 需要登录的判定：status 请求 401（配置了 Token 且未提供/不匹配）
+  const [needLogin, setNeedLogin] = useState(false)
+  useEffect(() => {
+    if (status === null) {
+      api.status().then(() => setNeedLogin(false)).catch((e) => {
+        setNeedLogin(String(e).includes('401'))
+      })
+    }
+  }, [])
   const orders = usePolling(api.orders, 3000)
   const rejections = usePolling(api.rejections, 5000)
   const [tf, setTf] = useState('1H')
@@ -82,6 +91,7 @@ export default function App() {
   const equity = usePolling(api.equityCurve, 30000)
   const [mo, setMo] = useState({ side: 'buy', type: 'limit', price: '', qty: '' })
   const [moMsg, setMoMsg] = useState('')
+  const [tokenInput, setTokenInput] = useState('')
 
   useEffect(() => {
     api.grid().then(setGrid).catch(() => {})
@@ -237,6 +247,39 @@ export default function App() {
     }
   }
 
+  if (needLogin) {
+    return (
+      <div className="app">
+        <header>
+          <h1>QuantForge 登录</h1>
+        </header>
+        <section className="wide">
+          <div className="card">
+            <div className="card-head">
+              <h2>访问令牌</h2>
+            </div>
+            <p className="sub">此后台配置了 Bearer Token（config.json dashboard.token），请输入：</p>
+            <div className="manual-grid" style={{ gridTemplateColumns: '1fr auto' }}>
+              <input
+                placeholder="dashboard.token 的值"
+                type="password"
+                value={tokenInput}
+                onChange={(e) => setTokenInput(e.target.value)}
+              />
+              <button
+                onClick={() => {
+                  auth.save(tokenInput.trim())
+                  location.reload()
+                }}
+              >
+                登录
+              </button>
+            </div>
+          </div>
+        </section>
+      </div>
+    )
+  }
   return (
     <div className="app">
       <header>

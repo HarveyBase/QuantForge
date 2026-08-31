@@ -44,6 +44,9 @@ func (f *fakeEx) GetTicker(ctx context.Context, symbol string) (exchange.Ticker,
 func (f *fakeEx) GetInstrument(ctx context.Context, instID string) (exchange.Instrument, error) {
 	return exchange.Instrument{Exchange: "fake", InstID: instID}, nil
 }
+func (f *fakeEx) GetOrderBook(ctx context.Context, symbol string, depth int) (exchange.OrderBook, error) {
+	return exchange.OrderBook{}, nil
+}
 func (f *fakeEx) GetBalances(ctx context.Context) ([]exchange.Balance, error) {
 	return []exchange.Balance{{Asset: "USDT", Total: 1e6, Available: 1e6}}, nil
 }

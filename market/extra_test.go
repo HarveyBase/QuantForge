@@ -93,6 +93,9 @@ func (s *stubEx) GetTicker(ctx context.Context, symbol string) (exchange.Ticker,
 func (s *stubEx) GetInstrument(ctx context.Context, instID string) (exchange.Instrument, error) {
 	return exchange.Instrument{}, nil
 }
+func (s *stubEx) GetOrderBook(ctx context.Context, symbol string, depth int) (exchange.OrderBook, error) {
+	return exchange.OrderBook{}, nil
+}
 func (s *stubEx) GetBalances(ctx context.Context) ([]exchange.Balance, error) { return nil, nil }
 func (s *stubEx) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (exchange.Order, error) {
 	return exchange.Order{}, nil

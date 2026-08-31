@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -510,5 +511,48 @@ func TestGetCandlesHistoryClamps(t *testing.T) {
 	c := newMockClient(t, http.NewServeMux())
 	if _, err := c.GetCandlesHistory(context.Background(), "BTC-USDT", "7x", 100); err == nil {
 		t.Fatal("非法周期必须报错")
+	}
+}
+
+func TestGetOrderBookParses(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v5/market/books", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("sz") != "50" || r.URL.Query().Get("instId") != "BTC-USDT" {
+			t.Errorf("参数错误: %s", r.URL.RawQuery)
+		}
+		// OKX 返回 asks 升序/bids 降序（最优在前）
+		w.Write([]byte(`{"code":"0","data":[{"asks":[["50001.2","0.5","0","1"],["50002.1","1.5","0","2"]],
+			"bids":[["49999.8","0.8","0","1"],["49998.7","2.0","0","3"]],"ts":"1700000000000"}]}`))
+	})
+	c := newMockClient(t, mux)
+	ob, err := c.GetOrderBook(context.Background(), "BTC-USDT", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ob.Bids) != 2 || len(ob.Asks) != 2 || ob.Ts != 1700000000000 {
+		t.Fatalf("盘口解析错误: %+v", ob)
+	}
+	if ob.Bids[0].Price != 49999.8 || ob.Asks[0].Price != 50001.2 {
+		t.Fatalf("最优档错误: %+v", ob)
+	}
+	// 价差（基点）≈ (50001.2-49999.8)/50000.5*10000 ≈ 0.28bp
+	bp := ob.SpreadBp()
+	if bp < 0.27 || bp > 0.29 {
+		t.Fatalf("价差计算错误: %v", bp)
+	}
+	bidN, askN := ob.DepthNotional(2)
+	if bidN <= 0 || askN <= 0 || math.Abs(bidN-(49999.8*0.8+49998.7*2.0)) > 1e-6 {
+		t.Fatalf("深度名义错误: %v %v", bidN, askN)
+	}
+}
+
+func TestGetOrderBookEmpty(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v5/market/books", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"code":"0","data":[]}`))
+	})
+	c := newMockClient(t, mux)
+	if _, err := c.GetOrderBook(context.Background(), "BTC-USDT", 50); err == nil {
+		t.Fatal("空盘口必须报错")
 	}
 }

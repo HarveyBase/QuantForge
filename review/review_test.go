@@ -196,3 +196,39 @@ func TestLoopStopsOnCancel(t *testing.T) {
 		t.Fatal("取消必须终止复盘循环")
 	}
 }
+
+func TestDailyDigest(t *testing.T) {
+	now := time.Now().UTC()
+	recs := []Record{ // 倒序（新→旧）
+		{Stage: "paper", Symbol: "BTC-USDT", Interval: "1H", Ts: now,
+			WindowFrom: now.Add(-time.Hour), Equity: 10500, WindowRetPct: 1.2, PriceChgPct: 0.8,
+			Fills: []FillSummary{{Side: "buy"}}, UMPBlocked: 2, OpenOrders: 1,
+			KillTripped: false, Strategy: "grid: rounds=3 | 市况 range",
+			Notes: []string{"窗口收益 1.20% vs 买入持有 0.80%（跑赢，paper 阶段口径，不代表实盘）"}},
+		{Stage: "paper", Symbol: "BTC-USDT", Interval: "1H", Ts: now.Add(-2 * time.Hour),
+			WindowFrom: now.Add(-3 * time.Hour), Equity: 10375,
+			Rejections: []RejSummary{{RuleID: "MAX_ORDER_NOTIONAL"}, {RuleID: "MAX_ORDER_NOTIONAL"}},
+			Notes:      []string{"风控拒单 2 笔：MAX_ORDER_NOTIONAL×2（拒单不静默，全部留痕）"}},
+	}
+	d := DailyDigest(recs)
+	for _, want := range []string{"复盘日报", "paper", "风险项", "MAX_ORDER_NOTIONAL×2", "UMP 拦截 2", "不构成投资建议"} {
+		if !strings.Contains(d, want) {
+			t.Fatalf("日报缺少 %q:\n%s", want, d)
+		}
+	}
+	// Kill 风险前置
+	recs[0].KillTripped, recs[0].KillReason = true, "当日回撤超限"
+	d2 := DailyDigest(recs)
+	if !strings.Contains(d2, "Kill Switch 触发中") {
+		t.Fatal("Kill 必须进风险项")
+	}
+	// 空记录
+	if DailyDigest(nil) == "" {
+		t.Fatal("空记录应有兜底文案")
+	}
+	// DigestSince 窗口过滤
+	short := DigestSince(recs, 30*time.Minute)
+	if !strings.Contains(short, "复盘日报") {
+		t.Fatal("窗口过滤后仍应输出")
+	}
+}

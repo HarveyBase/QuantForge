@@ -506,15 +506,18 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 		go a.exec.ReconcileLoop()
 	}
 
-	// 小时级复盘：停下来 → 生成记录落盘 → 恢复交易（失败留痕不中断进程）
+	// 小时级复盘：停下来 → 生成记录落盘 → 恢复交易（失败留痕不中断进程）；
+	// 每 24 个复盘周期聚合一次风控日报推送（Kriss 数据面，docs/09）
 	go func() {
 		ticker := time.NewTicker(a.reviewer.Every())
 		defer ticker.Stop()
+		cycles := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				cycles++
 				a.reviewing.Store(true)
 				rec, err := a.reviewer.ReviewOnce()
 				a.reviewing.Store(false)
@@ -527,6 +530,9 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 					rec.Ts.Format("15:04"), rec.WindowRetPct, rec.PriceChgPct, len(rec.Fills), len(rec.Rejections), rec.Stage)
 				for _, crit := range notify.Critical(*rec) {
 					a.notifier.Send(crit)
+				}
+				if cycles%24 == 0 {
+					a.notifier.Send(review.DailyDigest(a.reviewer.Recent(24)))
 				}
 			}
 		}
@@ -611,6 +617,14 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 	srv.RunCostScan = a.RunCostScan
 	srv.CurrentStrategy = a.CurrentStrategy
 	srv.SwitchStrategy = a.SwitchStrategy
+	srv.OrderBook = func() *exchange.OrderBook {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if ob, err := a.ex.GetOrderBook(ctx, cfg.Exchange.InstID, 50); err == nil {
+			return &ob
+		}
+		return nil
+	}
 	srv.Fills = func() []execution.Event {
 		var out []execution.Event
 		for _, ev := range a.exec.Events(500) {

@@ -37,6 +37,7 @@ type Server struct {
 	Grid            *grid.Grid
 	Snapshots       func() []exchange.Candle                           // 最近已确认 K 线
 	Candles         func(interval string, limit int) []exchange.Candle // SQLite 库读取（任意周期/全历史）
+	OrderBook       func() *exchange.OrderBook                         // 盘口深度（spread/流动性）
 	RunBacktest     func(ctx context.Context) (*backtest.Result, error)
 	RunWalkForward  func(ctx context.Context, strategyName string, train, test int) (*lab.WFReport, error)      // 研究工作台：WF
 	RunUMPCheck     func(ctx context.Context, strategyName string, minSamples int) (int, *ump.OOSReport, error) // 研究工作台：UMP
@@ -97,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/rejections", s.auth(s.handleRejections))
 	mux.HandleFunc("GET /api/events", s.auth(s.handleEvents))
 	mux.HandleFunc("GET /api/candles", s.auth(s.handleCandles))
+	mux.HandleFunc("GET /api/orderbook", s.auth(s.handleOrderBook))
 	mux.HandleFunc("GET /api/grid", s.auth(s.handleGrid))
 	mux.HandleFunc("GET /api/mode", s.auth(s.handleGetMode))
 	mux.HandleFunc("POST /api/mode", s.auth(s.handleSwitchMode))
@@ -230,6 +232,26 @@ func (s *Server) handleCandles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"candles": s.Snapshots()})
+}
+
+// handleOrderBook 盘口深度：spread（基点）与前 5 档流动性（滑点模型输入）。
+func (s *Server) handleOrderBook(w http.ResponseWriter, r *http.Request) {
+	if s.OrderBook == nil {
+		writeJSON(w, map[string]any{"orderbook": nil})
+		return
+	}
+	ob := s.OrderBook()
+	if ob == nil {
+		writeJSON(w, map[string]any{"orderbook": nil})
+		return
+	}
+	bidN, askN := ob.DepthNotional(5)
+	writeJSON(w, map[string]any{
+		"orderbook":   ob,
+		"spread_bp":   ob.SpreadBp(),
+		"bid_depth_5": bidN,
+		"ask_depth_5": askN,
+	})
 }
 
 func (s *Server) handleGrid(w http.ResponseWriter, r *http.Request) {

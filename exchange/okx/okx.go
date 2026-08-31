@@ -230,6 +230,41 @@ func (c *Client) GetTicker(ctx context.Context, symbol string) (exchange.Ticker,
 	return exchange.Ticker{Symbol: symbol, Last: toFloat(d.Last), Bid: toFloat(d.BidPx), Ask: toFloat(d.AskPx), Ts: toInt64(d.Ts)}, nil
 }
 
+// GetOrderBook 盘口深度（/api/v5/market/books，sz=档位数）。
+func (c *Client) GetOrderBook(ctx context.Context, symbol string, depth int) (exchange.OrderBook, error) {
+	if depth <= 0 || depth > 400 {
+		depth = 50
+	}
+	data, err := c.do(ctx, http.MethodGet, "/api/v5/market/books",
+		url.Values{"instId": {symbol}, "sz": {strconv.Itoa(depth)}}, nil, false)
+	if err != nil {
+		return exchange.OrderBook{}, err
+	}
+	var env struct {
+		Data []struct {
+			Bids [][]string `json:"bids"`
+			Asks [][]string `json:"asks"`
+			Ts   string     `json:"ts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil || len(env.Data) == 0 {
+		return exchange.OrderBook{}, fmt.Errorf("okx: 解析盘口失败: %v", err)
+	}
+	d := env.Data[0]
+	ob := exchange.OrderBook{Symbol: symbol, Ts: toInt64(d.Ts)}
+	for _, lv := range d.Bids {
+		if len(lv) >= 2 {
+			ob.Bids = append(ob.Bids, exchange.OrderBookLevel{Price: toFloat(lv[0]), Qty: toFloat(lv[1])})
+		}
+	}
+	for _, lv := range d.Asks {
+		if len(lv) >= 2 {
+			ob.Asks = append(ob.Asks, exchange.OrderBookLevel{Price: toFloat(lv[0]), Qty: toFloat(lv[1])})
+		}
+	}
+	return ob, nil
+}
+
 func (c *Client) GetInstrument(ctx context.Context, instID string) (exchange.Instrument, error) {
 	instType := "SPOT"
 	if strings.HasSuffix(instID, "-SWAP") {
