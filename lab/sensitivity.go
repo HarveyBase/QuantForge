@@ -12,11 +12,11 @@ import (
 
 // ParamPoint 单个参数点的回测成绩。
 type ParamPoint struct {
-	Label  string
-	Ret    float64 // 总收益 %
-	Mdd    float64 // 最大回撤 %（负值）
-	Calmar float64
-	Trades int
+	Label  string  `json:"label"`
+	Ret    float64 `json:"ret"` // 总收益 %
+	Mdd    float64 `json:"mdd"` // 最大回撤 %（负值）
+	Calmar float64 `json:"calmar"`
+	Trades int     `json:"trades"`
 }
 
 // ScanParams 参数扫描：对每个参数实例跑一次回测（试验数必须累计申报）。
@@ -43,11 +43,11 @@ func ScanParams(candles []exchange.Candle, cfg backtest.CostModel, seed float64,
 // 判定：邻域收益中位数 ≥ 基准收益 × decay 且基准收益 > 0 → 高原（参数可迁移）；
 // 否则孤针（过拟合警报，降级为研究线索，禁止晋级）。
 type PlateauReport struct {
-	Base      ParamPoint
-	Neighbors []ParamPoint
-	MedianRet float64 // 邻域收益中位数
-	IsPlateau bool
-	Reason    string
+	Base      ParamPoint   `json:"base"`
+	Neighbors []ParamPoint `json:"neighbors"`
+	MedianRet float64      `json:"median_ret"` // 邻域收益中位数
+	IsPlateau bool         `json:"is_plateau"`
+	Reason    string       `json:"reason"`
 }
 
 func PlateauCheck(points []ParamPoint, decay float64) (*PlateauReport, error) {
@@ -79,10 +79,10 @@ func PlateauCheck(points []ParamPoint, decay float64) (*PlateauReport, error) {
 
 // CostPoint 成本敏感性单点。
 type CostPoint struct {
-	Multiplier float64 // 成本倍数（1 = 基准）
-	Ret        float64
-	Mdd        float64
-	Trades     int
+	Multiplier float64 `json:"multiplier"` // 成本倍数（1 = 基准）
+	Ret        float64 `json:"ret"`
+	Mdd        float64 `json:"mdd"`
+	Trades     int     `json:"trades"`
 }
 
 // CostScan 成本敏感性扫描：把滑点与费率同乘倍数重跑（mults 如 {0, 0.5, 1, 2, 4}）。

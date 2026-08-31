@@ -74,6 +74,19 @@ export const api = {
       '/api/research/umpcheck',
       o,
     ),
+  researchPlateau: (o: { strategy: string }) =>
+    post<{
+      base: { label: string; ret: number; mdd: number; trades: number }
+      neighbors: { label: string; ret: number }[]
+      median_ret: number
+      is_plateau: boolean
+      reason: string
+    }>('/api/research/plateau', o),
+  researchCostScan: (o: { strategy: string }) =>
+    post<{ points: { multiplier: number; ret: number; mdd: number; trades: number }[] }>(
+      '/api/research/costscan',
+      o,
+    ),
 }
 
 export interface WFReport {

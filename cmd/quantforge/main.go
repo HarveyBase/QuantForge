@@ -607,6 +607,8 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 	srv.RecentReviews = a.reviewer.Recent
 	srv.RunWalkForward = runWF
 	srv.RunUMPCheck = runUMP
+	srv.RunPlateau = a.RunPlateau
+	srv.RunCostScan = a.RunCostScan
 	srv.CurrentStrategy = a.CurrentStrategy
 	srv.SwitchStrategy = a.SwitchStrategy
 	srv.Fills = func() []execution.Event {
@@ -772,6 +774,96 @@ func (a *app) CurrentStrategy() string {
 		return d.Describe()
 	}
 	return a.strat.Name()
+}
+
+// RunPlateau 参数邻域高原检验（研究工作台）。窗口=最近 3000 根。
+func (a *app) RunPlateau(ctx context.Context, strategyName string) (*lab.PlateauReport, error) {
+	all := a.fetchCandles(ctx, 600)
+	if len(all) < 300 {
+		return nil, fmt.Errorf("样本 %d 根不足 300", len(all))
+	}
+	// 敏感性检验用最近 3000 根（全历史 7 万根 ×3 点回测超出页面 120s 预算；结论按窗口标注）
+	if len(all) > 3000 {
+		all = all[len(all)-3000:]
+	}
+	candles := all
+	cost := backtest.CostModel{SlippageBps: a.cfg.Trading.SlippageBps, MakerFeeBps: 2, TakerFeeBps: 5}
+	mk := func(label string) strategy.Strategy {
+		switch strategyName {
+		case "grid": // 网格密度邻域：Grids±2（区间不变）
+			p := grid.Params{
+				Lower: a.cfg.Strategy.Grid.Lower, Upper: a.cfg.Strategy.Grid.Upper,
+				Grids: a.cfg.Strategy.Grid.Grids, QtyPerGrid: a.cfg.Strategy.Grid.QtyPerGrid,
+				Spacing: a.cfg.Strategy.Grid.Spacing, StopOnBreak: a.cfg.Strategy.Grid.StopOnBreak,
+			}
+			switch label {
+			case "entry-2":
+				p.Grids -= 2
+			case "entry+2":
+				p.Grids += 2
+			}
+			if p.Grids < 2 {
+				p.Grids = 2
+			}
+			g, err := grid.New(p)
+			if err != nil {
+				return a.grid
+			}
+			return g
+		default: // trend：EntryN 邻域 ±2（其余默认）
+			p := trend.Params{
+				EntryN: a.cfg.Strategy.Trend.EntryN, ExitN: a.cfg.Strategy.Trend.ExitN,
+				AtrN: a.cfg.Strategy.Trend.AtrN, AtrMult: a.cfg.Strategy.Trend.AtrMult,
+				RiskPct: a.cfg.Strategy.Trend.RiskPct, MaxPosPct: a.cfg.Strategy.Trend.MaxPosPct,
+			}
+			switch label {
+			case "entry-2":
+				p.EntryN -= 2
+			case "entry+2":
+				p.EntryN += 2
+			}
+			if p.EntryN < 2 {
+				p.EntryN = 2
+			}
+			s, _ := trend.New(p)
+			return s
+		}
+	}
+	labels := []string{"base", "entry-2", "entry+2"}
+	points, _, err := lab.ScanParams(candles, cost, 10000, a.cfg.Exchange.InstID, a.cfg.Trading.Interval, mk, labels...)
+	if err != nil {
+		return nil, err
+	}
+	return lab.PlateauCheck(points, 0.5)
+}
+
+// RunCostScan 成本敏感性扫描（研究工作台）。窗口=最近 3000 根。
+func (a *app) RunCostScan(ctx context.Context, strategyName string) ([]lab.CostPoint, error) {
+	all := a.fetchCandles(ctx, 600)
+	if len(all) < 300 {
+		return nil, fmt.Errorf("样本 %d 根不足 300", len(all))
+	}
+	if len(all) > 3000 {
+		all = all[len(all)-3000:]
+	}
+	candles := all
+	var mk func() strategy.Strategy
+	switch strategyName {
+	case "grid":
+		mk = func() strategy.Strategy { return a.grid }
+	default:
+		mk = func() strategy.Strategy {
+			s, _ := trend.New(trend.Params{
+				EntryN: a.cfg.Strategy.Trend.EntryN, ExitN: a.cfg.Strategy.Trend.ExitN,
+				AtrN: a.cfg.Strategy.Trend.AtrN, AtrMult: a.cfg.Strategy.Trend.AtrMult,
+				RiskPct: a.cfg.Strategy.Trend.RiskPct, MaxPosPct: a.cfg.Strategy.Trend.MaxPosPct,
+			})
+			return s
+		}
+	}
+	pts, _, err := lab.CostScan(candles, backtest.CostModel{SlippageBps: a.cfg.Trading.SlippageBps, MakerFeeBps: 2, TakerFeeBps: 5},
+		10000, a.cfg.Exchange.InstID, a.cfg.Trading.Interval, mk, 0, 0.5, 1, 2, 4)
+	return pts, err
 }
 
 // fetchCandles 数据降级链（docs/02 完整性优先）：缓存 → 实时拉取 → 快照 → 固定样本。

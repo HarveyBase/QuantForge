@@ -40,6 +40,8 @@ type Server struct {
 	RunBacktest     func(ctx context.Context) (*backtest.Result, error)
 	RunWalkForward  func(ctx context.Context, strategyName string, train, test int) (*lab.WFReport, error)      // 研究工作台：WF
 	RunUMPCheck     func(ctx context.Context, strategyName string, minSamples int) (int, *ump.OOSReport, error) // 研究工作台：UMP
+	RunPlateau      func(ctx context.Context, strategyName string) (*lab.PlateauReport, error)                  // 研究工作台：参数高原
+	RunCostScan     func(ctx context.Context, strategyName string) ([]lab.CostPoint, error)                     // 研究工作台：成本敏感性
 	RecentReviews   func(n int) []review.Record                                                                 // 最近 n 份小时复盘
 	Regime          func() regime.Reading                                                                       // 当前市况读数
 	CurrentStrategy func() string                                                                               // 当前策略描述
@@ -105,6 +107,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/strategy", s.auth(s.handleSwitchStrategy))
 	mux.HandleFunc("POST /api/research/walkforward", s.auth(s.handleResearchWF))
 	mux.HandleFunc("POST /api/research/umpcheck", s.auth(s.handleResearchUMP))
+	mux.HandleFunc("POST /api/research/plateau", s.auth(s.handleResearchPlateau))
+	mux.HandleFunc("POST /api/research/costscan", s.auth(s.handleResearchCostScan))
 	mux.HandleFunc("GET /api/fills", s.auth(s.handleFills))
 	mux.HandleFunc("GET /api/equitycurve", s.auth(s.handleEquityCurve))
 	mux.HandleFunc("POST /api/cancel", s.auth(s.handleCancel))
@@ -449,6 +453,49 @@ func (s *Server) handleResearchUMP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"trade_samples": n, "report": rep})
+}
+
+// handleResearchPlateau 参数邻域高原检验（过拟合警报器）。
+func (s *Server) handleResearchPlateau(w http.ResponseWriter, r *http.Request) {
+	if s.RunPlateau == nil {
+		http.Error(w, "未配置研究数据源", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Strategy string `json:"strategy"`
+	}
+	json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	rep, err := s.RunPlateau(ctx, req.Strategy)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, rep)
+}
+
+// handleResearchCostScan 成本敏感性扫描（2x 成本下转负即不可交易化）。
+func (s *Server) handleResearchCostScan(w http.ResponseWriter, r *http.Request) {
+	if s.RunCostScan == nil {
+		http.Error(w, "未配置研究数据源", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Strategy string `json:"strategy"`
+	}
+	json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	pts, err := s.RunCostScan(ctx, req.Strategy)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if pts == nil {
+		pts = []lab.CostPoint{}
+	}
+	writeJSON(w, map[string]any{"points": pts})
 }
 
 // handleFills 成交历史（最近 200 条成交事件）。

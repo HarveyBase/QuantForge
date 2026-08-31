@@ -833,3 +833,62 @@ func TestStrategyHotSwitch(t *testing.T) {
 		t.Fatalf("trend 配置应启动 trend: %s", a2.strat.Name())
 	}
 }
+
+func TestRunPlateauGridNeighborsDiffer(t *testing.T) {
+	// 预置一份价格在网格区间内的多样本（跨格充分），验证 grid 邻域三点确实不同
+	var sample []exchange.Candle
+	px := 60000.0
+	for i := 0; i < 800; i++ {
+		px = px * (1 + 0.004*float64(i%21-10)) // ±2% 震荡穿越网格
+		sample = append(sample, exchange.Candle{
+			Exchange: "okx", Symbol: "BTC-USDT", Interval: "1H",
+			OpenTime: int64(3600000 * (i + 1)),
+			Open:     px, High: px * 1.01, Low: px * 0.99, Close: px,
+			Volume: 5, Confirmed: true,
+		})
+	}
+	b, _ := json.Marshal(sample)
+	cfg := mockOKX(t)
+	os.MkdirAll(filepath.Join(cfg.DataDir, "samples"), 0o755)
+	os.WriteFile(filepath.Join(cfg.DataDir, "samples", "btc_usdt_1h.json"), b, 0o644)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := a.RunPlateau(context.Background(), "grid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	same := rep.Base.Ret == rep.Neighbors[0].Ret && rep.Neighbors[0].Ret == rep.Neighbors[1].Ret
+	trades := []int{rep.Base.Trades, rep.Neighbors[0].Trades, rep.Neighbors[1].Trades}
+	t.Logf("三点: %+v / 笔数 %v（相同=%v）", []float64{rep.Base.Ret, rep.Neighbors[0].Ret, rep.Neighbors[1].Ret}, trades, same)
+	if same && trades[0] > 0 {
+		t.Fatal("grid 邻域三点完全相同——邻域参数未生效（此前 serve 观察到的现象复现）")
+	}
+}
+
+func TestRunPlateauRealServePath(t *testing.T) {
+	// 完整复刻 serve 数据路径：真实 data/ 目录（快照层 + 固定样本层 + SQLite）
+	cfg := mockOKX(t)
+	cfg.DataDir = "/Users/lihao/go/src/QuantForge/data" // 真实运行目录
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := a.fetchCandles(context.Background(), 600)
+	if len(all) > 3000 {
+		all = all[len(all)-3000:]
+	}
+	t.Logf("fetchCandles 拿到 %d 根（截尾后），首根 %.0f 尾根 %.0f", len(all), all[0].Close, all[len(all)-1].Close)
+	rep, err := a.RunPlateau(context.Background(), "grid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("三点: %.2f/%.2f/%.2f 笔数 %d/%d/%d", rep.Base.Ret, rep.Neighbors[0].Ret, rep.Neighbors[1].Ret,
+		rep.Base.Trades, rep.Neighbors[0].Trades, rep.Neighbors[1].Trades)
+	if rep.Base.Trades == rep.Neighbors[0].Trades && rep.Neighbors[0].Trades == rep.Neighbors[1].Trades && rep.Base.Trades > 0 {
+		t.Log("复现 serve 现象：三点相同")
+	} else {
+		t.Log("三点不同（未复现）")
+	}
+}

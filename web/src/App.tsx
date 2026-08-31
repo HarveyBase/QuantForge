@@ -65,6 +65,17 @@ export default function App() {
   const [wfErr, setWfErr] = useState('')
   const [umpRes, setUmpRes] = useState<{ trade_samples: number; report: { usable: boolean; reason: string } } | null>(null)
   const [umpRunning, setUmpRunning] = useState(false)
+  const [plateau, setPlateau] = useState<{
+    base: { label: string; ret: number }
+    neighbors: { label: string; ret: number }[]
+    median_ret: number
+    is_plateau: boolean
+    reason: string
+  } | null>(null)
+  const [costScan, setCostScan] = useState<
+    { multiplier: number; ret: number; trades: number }[]
+  >([])
+  const [ptRunning, setPtRunning] = useState(false)
   const [modeMsg, setModeMsg] = useState('')
   const reviews = usePolling(() => api.reviews(5), 15000)
   const fills = usePolling(api.fills, 5000)
@@ -138,6 +149,27 @@ export default function App() {
       setWfErr(String(e).replace('Error: ', ''))
     } finally {
       setWfRunning(false)
+    }
+  }
+
+  const runPlateauScan = async () => {
+    setPtRunning(true)
+    setPlateau(null)
+    setCostScan([])
+    try {
+      const [pt, cs] = await Promise.all([
+        api.researchPlateau({ strategy: rsStrategy }),
+        api.researchCostScan({ strategy: rsStrategy }),
+      ])
+      setPlateau(pt)
+      setCostScan(cs.points ?? [])
+    } catch (e) {
+      setPlateau({
+        base: { label: '', ret: 0 }, neighbors: [], median_ret: 0,
+        is_plateau: false, reason: String(e).replace('Error: ', ''),
+      })
+    } finally {
+      setPtRunning(false)
     }
   }
 
@@ -517,6 +549,7 @@ export default function App() {
               <input placeholder="test" value={rsTest} onChange={(e) => setRsTest(e.target.value)} />
               <button onClick={runWF} disabled={wfRunning}>{wfRunning ? 'WF 运行中…' : '跑 walk-forward'}</button>
               <button onClick={runUMP} disabled={umpRunning}>{umpRunning ? 'UMP 验证中…' : 'UMP 拦截器验证'}</button>
+              <button onClick={runPlateauScan} disabled={ptRunning}>{ptRunning ? '检验中…' : '参数高原+成本扫描'}</button>
             </div>
           }
         >
@@ -554,6 +587,51 @@ export default function App() {
             <div className={umpRes.report.usable ? 'sub up' : 'sub warn'}>
               UMP（{umpRes.trade_samples} 笔样本）：{umpRes.report.reason}
             </div>
+          )}
+          {plateau && (
+            <>
+              <div className={plateau.is_plateau ? 'sub up' : 'sub warn'}>
+                参数高原：{plateau.reason}
+              </div>
+              <table>
+                <thead>
+                  <tr><th>参数点</th><th>收益</th><th>角色</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>{plateau.base.label}</td>
+                    <td className={plateau.base.ret >= 0 ? 'up' : 'down'}>{plateau.base.ret.toFixed(2)}%</td>
+                    <td>基准</td>
+                  </tr>
+                  {plateau.neighbors.map((n) => (
+                    <tr key={n.label}>
+                      <td>{n.label}</td>
+                      <td className={n.ret >= 0 ? 'up' : 'down'}>{n.ret.toFixed(2)}%</td>
+                      <td>邻域</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+          {costScan.length > 0 && (
+            <>
+              <div className="sub">成本敏感性（2x 转负即不可交易化）：</div>
+              <table>
+                <thead>
+                  <tr><th>成本倍数</th><th>收益</th><th>交易</th></tr>
+                </thead>
+                <tbody>
+                  {costScan.map((p) => (
+                    <tr key={p.multiplier}>
+                      <td>{p.multiplier}x</td>
+                      <td className={p.ret >= 0 ? 'up' : 'down'}>{p.ret.toFixed(2)}%</td>
+                      <td>{p.trades}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
           )}
           {!wf && !umpRes && !wfErr && <div className="sub">walk-forward 样本外验证与 UMP 拦截器验证（需先 fetch 长历史）</div>}
         </Card>
