@@ -55,6 +55,8 @@ export default function App() {
   const [tripReason, setTripReason] = useState('')
   const [killMsg, setKillMsg] = useState('')
   const modeInfo = usePolling(api.mode, 5000)
+  const strategyInfo = usePolling(api.strategy, 8000)
+  const [stratMsg, setStratMsg] = useState('')
   const [modeMsg, setModeMsg] = useState('')
   const reviews = usePolling(() => api.reviews(5), 15000)
   const fills = usePolling(api.fills, 5000)
@@ -111,6 +113,16 @@ export default function App() {
       await api.cancelOrder(orderId)
     } catch (e) {
       window.__lastCancelErr = String(e)
+    }
+  }
+
+  const switchStrategy = async (name: string) => {
+    setStratMsg('')
+    try {
+      await api.switchStrategy(name)
+      setStratMsg(`策略已切到 ${name}（无持仓时生效）`)
+    } catch (e) {
+      setStratMsg(String(e).replace('Error: ', ''))
     }
   }
 
@@ -172,6 +184,15 @@ export default function App() {
             <span className={`badge ks-${status.kill_switch.tripped ? 'on' : 'off'}`}>
               Kill Switch {status.kill_switch.tripped ? '已触发' : '正常'}
             </span>
+            {strategyInfo && (
+              <span className="badge">策略: {strategyInfo.desc || strategyInfo.name}</span>
+            )}
+            {strategyInfo?.available?.map((m) => (
+              <button key={m} className="mode-btn" onClick={() => switchStrategy(m)}>
+                {m === 'grid' ? '切网格' : m === 'trend' ? '切趋势' : '切组合'}
+              </button>
+            ))}
+            {stratMsg && <span className="sub">{stratMsg}</span>}
             {status.regime && (
               <span className={`badge regime-${status.regime.kind}`}>
                 市况: {status.regime.kind === 'trending' ? '趋势' : status.regime.kind === 'range' ? '震荡' : '过渡'}

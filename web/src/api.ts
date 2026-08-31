@@ -64,6 +64,9 @@ export const api = {
     post<{ cancelled: string }>('/api/cancel', { order_id: orderId }),
   manualOrder: (o: { side: string; type: string; price: number; qty: number }) =>
     post<{ order_id: string }>('/api/order', o),
+  strategy: () =>
+    get<{ name: string; desc: string; available: string[] }>('/api/strategy'),
+  switchStrategy: (name: string) => post('/api/strategy', { name }),
 }
 
 export interface FillEvent {

@@ -8,12 +8,12 @@ import (
 
 // Context 策略可见的全部世界：截至当前已收盘的 K 线 + 账户状态。
 type Context struct {
-	Symbol    string
-	Interval  string
-	Candles   []exchange.Candle // 时间升序、全部已收盘，最后一根为当前根
-	Equity    float64           // 当前总权益
-	Position  float64           // 当前净持仓（Base）
-	Cash      float64
+	Symbol   string
+	Interval string
+	Candles  []exchange.Candle // 时间升序、全部已收盘，最后一根为当前根
+	Equity   float64           // 当前总权益
+	Position float64           // 当前净持仓（Base）
+	Cash     float64
 }
 
 // Last 最新一根已收盘 K 线。
@@ -26,12 +26,12 @@ func (c *Context) Last() exchange.Candle {
 
 // OrderIntent 策略产出的订单意图（未过风控、未提交）。
 type OrderIntent struct {
-	Kind        string             `json:"kind"` // open / close / rebalance 等（策略自定义语义）
-	Side        exchange.Side      `json:"side"`
-	Type        exchange.OrderType `json:"type"`
-	Price       float64            `json:"price"`
-	Qty         float64            `json:"qty"`
-	Note        string             `json:"note,omitempty"`
+	Kind  string             `json:"kind"` // open / close / rebalance 等（策略自定义语义）
+	Side  exchange.Side      `json:"side"`
+	Type  exchange.OrderType `json:"type"`
+	Price float64            `json:"price"`
+	Qty   float64            `json:"qty"`
+	Note  string             `json:"note,omitempty"`
 }
 
 // Strategy 策略接口。OnCandle 在每根 K 线收盘后调用一次，返回本根要下的订单意图。

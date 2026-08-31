@@ -545,3 +545,47 @@ func TestManualOrderAndCancel(t *testing.T) {
 		t.Fatalf("无执行器应 503: %d", r5.StatusCode)
 	}
 }
+
+func TestStrategySwitchEndpoints(t *testing.T) {
+	s := newServerForTest(t)
+	cur := "grid:entry20"
+	s.CurrentStrategy = func() string { return cur }
+	s.SwitchStrategy = func(name string) error {
+		if name == "yolo" {
+			return fmt.Errorf("未知策略")
+		}
+		cur = name
+		return nil
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	resp, _ := http.Get(srv.URL + "/api/strategy")
+	var body struct {
+		Name      string   `json:"name"`
+		Desc      string   `json:"desc"`
+		Available []string `json:"available"`
+	}
+	json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if body.Name != "grid" || body.Desc != "grid:entry20" || len(body.Available) != 3 {
+		t.Fatalf("strategy 信息错误: %+v", body)
+	}
+	// 切换成功
+	r2, _ := http.Post(srv.URL+"/api/strategy", "application/json", strings.NewReader(`{"name":"trend"}`))
+	r2.Body.Close()
+	if r2.StatusCode != 200 || cur != "trend" {
+		t.Fatalf("切换失败: %d cur=%s", r2.StatusCode, cur)
+	}
+	// 未知策略 403
+	r3, _ := http.Post(srv.URL+"/api/strategy", "application/json", strings.NewReader(`{"name":"yolo"}`))
+	r3.Body.Close()
+	if r3.StatusCode != 403 {
+		t.Fatalf("未知策略应 403: %d", r3.StatusCode)
+	}
+	// 空 name 400
+	r4, _ := http.Post(srv.URL+"/api/strategy", "application/json", strings.NewReader(`{}`))
+	r4.Body.Close()
+	if r4.StatusCode != 400 {
+		t.Fatalf("空 name 应 400: %d", r4.StatusCode)
+	}
+}

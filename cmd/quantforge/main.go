@@ -94,7 +94,8 @@ type app struct {
 	pf         *portfolio.Portfolio
 	rk         *risk.Manager
 	exec       *execution.Executor
-	grid       *grid.Grid
+	grid       *grid.Grid        // grid 策略实例（nil 当选 trend；dashboard 网格视图用）
+	strat      strategy.Strategy // 当前活跃策略（grid/trend，页面可热切）
 	pol        *market.Poller
 	snap       *market.SnapshotStore
 	reviewer   *review.Reviewer
@@ -160,15 +161,37 @@ func buildApp(cfg *config.Config) (*app, error) {
 		return nil, err
 	}
 	a := &app{
-		cfg: cfg, ex: ex, pf: pf, rk: rk, grid: g,
+		cfg: cfg, ex: ex, pf: pf, rk: rk, grid: g, strat: g,
 		snap: market.NewSnapshotStore(cfg.DataDir),
 		pol:  &market.Poller{Ex: ex, Symbol: cfg.Exchange.InstID, Interval: cfg.Trading.Interval},
+	}
+	if cfg.Strategy.Name == "trend" || cfg.Strategy.Name == "both" {
+		tr, terr := trend.New(trend.Params{
+			EntryN: cfg.Strategy.Trend.EntryN, ExitN: cfg.Strategy.Trend.ExitN,
+			AtrN: cfg.Strategy.Trend.AtrN, AtrMult: cfg.Strategy.Trend.AtrMult,
+			RiskPct: cfg.Strategy.Trend.RiskPct, MaxPosPct: cfg.Strategy.Trend.MaxPosPct,
+		})
+		if terr != nil {
+			return nil, terr
+		}
+		if cfg.Strategy.Name == "trend" {
+			a.strat = tr
+		} else {
+			// 组合：grid+trend 按权重分资金（regime 路由默认关——证据纪律）
+			a.strat = strategy.NewComposite([]string{"grid", "trend"},
+				[]strategy.Strategy{g, tr},
+				[]float64{cfg.Strategy.Both.GridWeight, cfg.Strategy.Both.TrendWeight})
+		}
 	}
 	// paper/live 才有执行器；research 用空执行器（后台展示零订单）
 	if cfg.Mode != config.ModeResearch {
 		a.exec = execution.New(ex, rk, pf, func(ev execution.Event) {
 			if ev.Order.FilledQty > 0 {
-				a.grid.ApplyFill(ev.Order.Side, ev.Order.FilledQty, ev.Order.AvgPrice)
+				if g, ok := a.strat.(interface {
+					ApplyFill(exchange.Side, float64, float64)
+				}); ok {
+					g.ApplyFill(ev.Order.Side, ev.Order.FilledQty, ev.Order.AvgPrice)
+				}
 			}
 		})
 		rk.Kill.OnTrip(func(reason string) {
@@ -246,9 +269,17 @@ func (a *app) onCandles(candles []exchange.Candle) {
 	a.mu.Unlock()
 	a.persistState()
 	a.pf.UpdateMark(a.cfg.Exchange.InstID, last.Close)
-	if rd := a.regimeDet.Update(candles); rd.Kind == regime.Trending {
+	rd := a.regimeDet.Update(candles)
+	if rd.Kind == regime.Trending {
 		// 信息面留痕：趋势市对网格是逆风（只赚震荡的钱），日志可见
 		log.Printf("%s", rd.Describe())
+	}
+	// regime 自动路由（默认关，config 显式开启才生效——证据纪律 docs/10 §6）
+	if a.cfg.Strategy.Both.RegimeRoute {
+		if cp, ok := a.strat.(*strategy.Composite); ok {
+			cp.SetActive("grid", rd.Kind != regime.Trending)
+			cp.SetActive("trend", rd.Kind != regime.Range)
+		}
 	}
 	// 快照留痕（每次新收盘根固化一次）
 	if _, err := a.snap.Save(snapshotName(a.cfg), candles); err != nil {
@@ -278,7 +309,7 @@ func (a *app) onCandles(candles []exchange.Candle) {
 		Symbol: a.cfg.Exchange.InstID, Interval: a.cfg.Trading.Interval,
 		Candles: candles, Equity: a.pf.Equity(), Position: posQty, Cash: cash,
 	}
-	for intentIndex, intent := range a.grid.OnCandle(sctx) {
+	for intentIndex, intent := range a.strat.OnCandle(sctx) {
 		// UMP 拦截：只拦买入（离场信号自由）；卖出是风险释放不该被拦
 		if a.umpOn && a.umpFilter != nil && intent.Side == exchange.Buy {
 			if fe, err := ump.Extract(candles, len(candles)-1); err == nil {
@@ -381,10 +412,15 @@ func (a *app) collectReviewInput(from time.Time) review.Input {
 		in.CandlesSeen++
 	}
 	a.mu.RUnlock()
-	if a.grid != nil {
-		st := a.grid.Stats()
+	switch st := a.strat.(type) {
+	case *grid.Grid:
+		gs := st.Stats()
 		in.Strategy = fmt.Sprintf("grid: rounds=%d realized=%.2f broke=%v position=%.4f | 市况 %s",
-			st.Rounds, st.Realized, st.Broke, st.Position, a.regimeDet.Current())
+			gs.Rounds, gs.Realized, gs.Broke, gs.Position, a.regimeDet.Current())
+	case *trend.Donchian:
+		in.Strategy = fmt.Sprintf("trend: %s | 市况 %s", st.Describe(), a.regimeDet.Current())
+	default:
+		in.Strategy = fmt.Sprintf("%s | 市况 %s", a.strat.Name(), a.regimeDet.Current())
 	}
 	return in
 }
@@ -509,6 +545,8 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 		return append([]exchange.Candle(nil), a.candles...)
 	}, runBacktest)
 	srv.RecentReviews = a.reviewer.Recent
+	srv.CurrentStrategy = a.CurrentStrategy
+	srv.SwitchStrategy = a.SwitchStrategy
 	srv.Fills = func() []execution.Event {
 		var out []execution.Event
 		for _, ev := range a.exec.Events(500) {
@@ -616,6 +654,62 @@ func (a *app) SwitchMode(target config.Mode, confirm string) error {
 	}
 	a.activeMode.Store(string(target))
 	return nil
+}
+
+// SwitchStrategy 页面热切策略：仅无持仓时允许（持仓中换策略=退出规则悬空，禁止）。
+func (a *app) SwitchStrategy(name string) error {
+	var s strategy.Strategy
+	switch name {
+	case "grid":
+		g, err := grid.New(grid.Params{
+			Lower: a.cfg.Strategy.Grid.Lower, Upper: a.cfg.Strategy.Grid.Upper,
+			Grids: a.cfg.Strategy.Grid.Grids, QtyPerGrid: a.cfg.Strategy.Grid.QtyPerGrid,
+			Spacing: a.cfg.Strategy.Grid.Spacing, StopOnBreak: a.cfg.Strategy.Grid.StopOnBreak,
+		})
+		if err != nil {
+			return err
+		}
+		s = g
+	case "trend":
+		tr, err := trend.New(trend.Params{
+			EntryN: a.cfg.Strategy.Trend.EntryN, ExitN: a.cfg.Strategy.Trend.ExitN,
+			AtrN: a.cfg.Strategy.Trend.AtrN, AtrMult: a.cfg.Strategy.Trend.AtrMult,
+			RiskPct: a.cfg.Strategy.Trend.RiskPct, MaxPosPct: a.cfg.Strategy.Trend.MaxPosPct,
+		})
+		if err != nil {
+			return err
+		}
+		s = tr
+	case "both":
+		tr, err := trend.New(trend.Params{
+			EntryN: a.cfg.Strategy.Trend.EntryN, ExitN: a.cfg.Strategy.Trend.ExitN,
+			AtrN: a.cfg.Strategy.Trend.AtrN, AtrMult: a.cfg.Strategy.Trend.AtrMult,
+			RiskPct: a.cfg.Strategy.Trend.RiskPct, MaxPosPct: a.cfg.Strategy.Trend.MaxPosPct,
+		})
+		if err != nil {
+			return err
+		}
+		s = strategy.NewComposite([]string{"grid", "trend"}, []strategy.Strategy{a.grid, tr},
+			[]float64{a.cfg.Strategy.Both.GridWeight, a.cfg.Strategy.Both.TrendWeight})
+	default:
+		return fmt.Errorf("未知策略 %q（支持 grid / trend / both）", name)
+	}
+	_, positions, _ := a.pf.Snapshot()
+	for _, p := range positions {
+		if p.Qty != 0 {
+			return fmt.Errorf("持仓中禁止切换策略（%s 数量 %v，先平仓再切）", p.Symbol, p.Qty)
+		}
+	}
+	a.strat = s
+	return nil
+}
+
+// CurrentStrategy 当前策略名与描述。
+func (a *app) CurrentStrategy() string {
+	if d, ok := a.strat.(interface{ Describe() string }); ok {
+		return d.Describe()
+	}
+	return a.strat.Name()
 }
 
 // fetchCandles 数据降级链（docs/02 完整性优先）：缓存 → 实时拉取 → 快照 → 固定样本。

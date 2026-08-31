@@ -781,3 +781,55 @@ func TestLiveBootModeMatrix(t *testing.T) {
 		t.Fatal("切回后活跃环境应为 live")
 	}
 }
+
+func TestStrategyHotSwitch(t *testing.T) {
+	t.Setenv("OKX_API_KEY", "k")
+	t.Setenv("OKX_SECRET", "s")
+	t.Setenv("OKX_PASSPHRASE", "p")
+	// research 启动（不同步持仓）测热切路径
+	cfg := mockOKX(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.strat.Name() != "grid" {
+		t.Fatal("默认策略应为 grid")
+	}
+	// 无持仓热切 trend
+	if err := a.SwitchStrategy("trend"); err != nil {
+		t.Fatal(err)
+	}
+	if a.strat.Name() != "trend_donchian" {
+		t.Fatalf("切换后策略错误: %s", a.strat.Name())
+	}
+	if a.CurrentStrategy() == "" {
+		t.Fatal("策略描述不应为空")
+	}
+	// 未知策略
+	if err := a.SwitchStrategy("yolo"); err == nil {
+		t.Fatal("未知策略必须拒绝")
+	}
+	// paper 启动同步了 mock 余额持仓（BTC 0.05）：持仓中拒绝切换
+	cfgP := mockOKX(t)
+	cfgP.Mode = config.ModePaper
+	ap, err := buildApp(cfgP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ap.exec.Stop()
+	if err := ap.SwitchStrategy("trend"); err == nil {
+		t.Fatal("持仓中切换必须被拒绝（退出规则不得悬空）")
+	}
+	// trend 配置启动
+	cfg2 := mockOKX(t)
+	cfg2.Mode = config.ModePaper
+	cfg2.Strategy.Name = "trend"
+	a2, err := buildApp(cfg2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.exec.Stop()
+	if a2.strat.Name() != "trend_donchian" {
+		t.Fatalf("trend 配置应启动 trend: %s", a2.strat.Name())
+	}
+}

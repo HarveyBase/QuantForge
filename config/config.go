@@ -63,8 +63,29 @@ type RiskConfig struct {
 }
 
 type StrategyConfig struct {
-	Name string     `json:"name"` // grid
-	Grid GridConfig `json:"grid"`
+	Name  string      `json:"name"` // grid | trend | both（组合）
+	Grid  GridConfig  `json:"grid"`
+	Trend TrendConfig `json:"trend"`
+	// BothConfig 组合模式：grid+trend 并行按权重分资金。
+	Both BothConfig `json:"both"`
+}
+
+type BothConfig struct {
+	GridWeight  float64 `json:"grid_weight"`  // grid 资金权重（0-1]
+	TrendWeight float64 `json:"trend_weight"` // trend 资金权重（0-1]
+	// RegimeRoute 按 regime 自动路由（趋势市只跑 trend、震荡市只跑 grid）。
+	// 默认 false：docs/10 §6 互补性在真实样本不成立，无 OOS 证据不开自动切换。
+	RegimeRoute bool `json:"regime_route"`
+}
+
+// TrendConfig 趋势策略参数（docs/10 假设卡口径）。
+type TrendConfig struct {
+	EntryN    int     `json:"entry_n"`     // 入场突破窗口
+	ExitN     int     `json:"exit_n"`      // 出场通道窗口
+	AtrN      int     `json:"atr_n"`       // ATR 周期
+	AtrMult   float64 `json:"atr_mult"`    // 跟踪止损倍数
+	RiskPct   float64 `json:"risk_pct"`    // 单笔风险比例
+	MaxPosPct float64 `json:"max_pos_pct"` // 单笔仓位上限
 }
 
 type GridConfig struct {
@@ -109,7 +130,9 @@ func Default() *Config {
 			CooldownAfterRejectSec: 30,
 		},
 		Strategy: StrategyConfig{
-			Name: "grid",
+			Name:  "grid",
+			Trend: TrendConfig{EntryN: 20, ExitN: 10, AtrN: 14, AtrMult: 2, RiskPct: 0.005, MaxPosPct: 0.5},
+			Both:  BothConfig{GridWeight: 0.5, TrendWeight: 0.3, RegimeRoute: false},
 			Grid: GridConfig{
 				Lower: 40000, Upper: 80000, Grids: 20,
 				QtyPerGrid: 0.001, Spacing: "geo", StopOnBreak: true,
@@ -197,6 +220,11 @@ func (c *Config) Validate() error {
 	if c.Risk.CooldownAfterRejectSec < 0 {
 		return fmt.Errorf("config: cooldown_after_reject_sec 不能为负")
 	}
+	switch c.Strategy.Name {
+	case "grid", "trend", "both":
+	default:
+		return fmt.Errorf("config: strategy.name 必须是 grid/trend，当前 %q", c.Strategy.Name)
+	}
 	g := c.Strategy.Grid
 	if c.Strategy.Name == "grid" {
 		if g.Lower <= 0 || g.Upper <= g.Lower {
@@ -212,6 +240,12 @@ func (c *Config) Validate() error {
 		case "arith", "geo":
 		default:
 			return fmt.Errorf("config: grid.spacing 必须是 arith/geo，当前 %q", g.Spacing)
+		}
+	}
+	if c.Strategy.Name == "both" {
+		b := c.Strategy.Both
+		if b.GridWeight <= 0 || b.GridWeight > 1 || b.TrendWeight <= 0 || b.TrendWeight > 1 {
+			return fmt.Errorf("config: strategy.both 权重必须在 (0,1]（权重和 <1 时剩余为现金缓冲——永不满仓）")
 		}
 	}
 	return nil

@@ -28,20 +28,22 @@ import (
 
 // Server 后台服务。
 type Server struct {
-	Cfg           *config.Config
-	Pf            *portfolio.Portfolio
-	Rk            *risk.Manager
-	Ex            OrderSource
-	Grid          *grid.Grid
-	Snapshots     func() []exchange.Candle                           // 最近已确认 K 线
-	Candles       func(interval string, limit int) []exchange.Candle // SQLite 库读取（任意周期/全历史）
-	RunBacktest   func(ctx context.Context) (*backtest.Result, error)
-	RecentReviews func(n int) []review.Record                                                  // 最近 n 份小时复盘
-	Regime        func() regime.Reading                                                        // 当前市况读数
-	Fills         func() []execution.Event                                                     // 成交历史（事件流过滤）
-	EquityCurve   func() []review.Record                                                       // 权益曲线数据源（复盘记录聚合）
-	CancelOrder   func(ctx context.Context, id string) error                                   // 手动撤单
-	PlaceOrder    func(ctx context.Context, req exchange.OrderRequest) (exchange.Order, error) // 手动下单（走风控）
+	Cfg             *config.Config
+	Pf              *portfolio.Portfolio
+	Rk              *risk.Manager
+	Ex              OrderSource
+	Grid            *grid.Grid
+	Snapshots       func() []exchange.Candle                           // 最近已确认 K 线
+	Candles         func(interval string, limit int) []exchange.Candle // SQLite 库读取（任意周期/全历史）
+	RunBacktest     func(ctx context.Context) (*backtest.Result, error)
+	RecentReviews   func(n int) []review.Record                                                  // 最近 n 份小时复盘
+	Regime          func() regime.Reading                                                        // 当前市况读数
+	CurrentStrategy func() string                                                                // 当前策略描述
+	SwitchStrategy  func(name string) error                                                      // 热切策略（无持仓才允许）
+	Fills           func() []execution.Event                                                     // 成交历史（事件流过滤）
+	EquityCurve     func() []review.Record                                                       // 权益曲线数据源（复盘记录聚合）
+	CancelOrder     func(ctx context.Context, id string) error                                   // 手动撤单
+	PlaceOrder      func(ctx context.Context, req exchange.OrderRequest) (exchange.Order, error) // 手动下单（走风控）
 	// ModeSwap 页面热切活跃环境（research↔paper；live 受启动配置门禁，见 cmd.SwitchMode）
 	ActiveMode func() config.Mode // 当前活跃环境
 	BootMode   config.Mode        // 启动配置环境（能力上界）
@@ -95,6 +97,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/killswitch", s.auth(s.handleKillSwitch))
 	mux.HandleFunc("POST /api/backtest", s.auth(s.handleBacktest))
 	mux.HandleFunc("GET /api/reviews", s.auth(s.handleReviews))
+	mux.HandleFunc("GET /api/strategy", s.auth(s.handleGetStrategy))
+	mux.HandleFunc("POST /api/strategy", s.auth(s.handleSwitchStrategy))
 	mux.HandleFunc("GET /api/fills", s.auth(s.handleFills))
 	mux.HandleFunc("GET /api/equitycurve", s.auth(s.handleEquityCurve))
 	mux.HandleFunc("POST /api/cancel", s.auth(s.handleCancel))
@@ -353,6 +357,39 @@ func (s *Server) handleReviews(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, map[string]any{"reviews": s.RecentReviews(n)})
+}
+
+// handleGetStrategy 当前策略信息。
+func (s *Server) handleGetStrategy(w http.ResponseWriter, r *http.Request) {
+	desc := ""
+	if s.CurrentStrategy != nil {
+		desc = s.CurrentStrategy()
+	}
+	writeJSON(w, map[string]any{
+		"name": s.Cfg.Strategy.Name, "desc": desc,
+		"available": []string{"grid", "trend", "both"},
+	})
+}
+
+// handleSwitchStrategy 热切策略（持仓中拒绝——退出规则不得悬空）。
+func (s *Server) handleSwitchStrategy(w http.ResponseWriter, r *http.Request) {
+	if s.SwitchStrategy == nil {
+		http.Error(w, "本部署不支持策略切换", http.StatusNotImplemented)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name 必填", http.StatusBadRequest)
+		return
+	}
+	if err := s.SwitchStrategy(req.Name); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	s.Broadcast("strategy_switch", map[string]any{"name": req.Name})
+	writeJSON(w, map[string]any{"switched": req.Name})
 }
 
 // handleFills 成交历史（最近 200 条成交事件）。
