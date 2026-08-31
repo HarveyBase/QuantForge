@@ -60,3 +60,6 @@ data/state/
 
 # SQLite K 线缓存库（运行时数据，可由 fetch/serve 重建）
 data/candles.db*
+
+# 构建产物
+quantforge
