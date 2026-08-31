@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { NavLink, Route, Routes } from 'react-router-dom'
 import { api, auth, streamURL } from './api'
 import type { FillEvent, ModeInfo, ReviewRecord, WFReport } from './api'
 import type { BacktestResult, Candle, GridStats, Order, Rejection } from './types'
@@ -42,59 +43,32 @@ function usePolling<T>(fetcher: () => Promise<T>, intervalMs: number): T | null 
 }
 
 export default function App() {
+  return (
+    <Layout>
+      <Routes>
+        <Route path="/" element={<RunPage />} />
+        <Route path="/research" element={<ResearchPage />} />
+        <Route path="/trade" element={<TradePage />} />
+      </Routes>
+    </Layout>
+  )
+}
+
+// Layout 共享头部（状态/环境切换/策略切换/市况/SSE）+ 三页导航。
+function Layout({ children }: { children: React.ReactNode }) {
   const status = usePolling(api.status, 2000)
-  // 需要登录的判定：status 请求 401（配置了 Token 且未提供/不匹配）
   const [needLogin, setNeedLogin] = useState(false)
-  useEffect(() => {
-    if (status === null) {
-      api.status().then(() => setNeedLogin(false)).catch((e) => {
-        setNeedLogin(String(e).includes('401'))
-      })
-    }
-  }, [])
-  const orders = usePolling(api.orders, 3000)
-  const rejections = usePolling(api.rejections, 5000)
-  const [tf, setTf] = useState('1H')
-  const candles = usePolling(() => api.candles(tf), 15000)
-  const [grid, setGrid] = useState<{ levels?: number[]; stats?: GridStats }>({})
-  const [bt, setBt] = useState<BacktestResult | null>(null)
-  const [btRunning, setBtRunning] = useState(false)
-  const [btError, setBtError] = useState('')
+  const [tokenInput, setTokenInput] = useState('')
   const [flash, setFlash] = useState('')
-  const [tripReason, setTripReason] = useState('')
-  const [killMsg, setKillMsg] = useState('')
   const modeInfo = usePolling(api.mode, 5000)
   const strategyInfo = usePolling(api.strategy, 8000)
-  const [stratMsg, setStratMsg] = useState('')
-  const [rsStrategy, setRsStrategy] = useState('trend')
-  const [rsTrain, setRsTrain] = useState('300')
-  const [rsTest, setRsTest] = useState('100')
-  const [wf, setWf] = useState<WFReport | null>(null)
-  const [wfRunning, setWfRunning] = useState(false)
-  const [wfErr, setWfErr] = useState('')
-  const [umpRes, setUmpRes] = useState<{ trade_samples: number; report: { usable: boolean; reason: string } } | null>(null)
-  const [umpRunning, setUmpRunning] = useState(false)
-  const [plateau, setPlateau] = useState<{
-    base: { label: string; ret: number }
-    neighbors: { label: string; ret: number }[]
-    median_ret: number
-    is_plateau: boolean
-    reason: string
-  } | null>(null)
-  const [costScan, setCostScan] = useState<
-    { multiplier: number; ret: number; trades: number }[]
-  >([])
-  const [ptRunning, setPtRunning] = useState(false)
   const [modeMsg, setModeMsg] = useState('')
-  const reviews = usePolling(() => api.reviews(5), 15000)
-  const fills = usePolling(api.fills, 5000)
-  const equity = usePolling(api.equityCurve, 30000)
-  const [mo, setMo] = useState({ side: 'buy', type: 'limit', price: '', qty: '' })
-  const [moMsg, setMoMsg] = useState('')
-  const [tokenInput, setTokenInput] = useState('')
+  const [stratMsg, setStratMsg] = useState('')
 
   useEffect(() => {
-    api.grid().then(setGrid).catch(() => {})
+    api.status().then(() => setNeedLogin(false)).catch((e) => {
+      setNeedLogin(String(e).includes('401'))
+    })
   }, [])
 
   // SSE 事件流（自动重连由浏览器完成）
@@ -104,106 +78,8 @@ export default function App() {
       const msg = JSON.parse((e as MessageEvent).data)
       setFlash(`${new Date(msg.ts).toLocaleTimeString()} ${msg.kind}`)
     })
-    // onerror 不主动 close：EventSource 浏览器自动重连（主动 close 会永久断连）
     return () => es.close()
   }, [])
-
-  const runBacktest = async () => {
-    setBtRunning(true)
-    setBtError('')
-    try {
-      setBt(await api.backtest())
-    } catch (e) {
-      setBtError(String(e))
-    } finally {
-      setBtRunning(false)
-    }
-  }
-  const btDone = bt ? new Date(bt.sample_to).toLocaleString() : ''
-
-  const submitManual = async () => {
-    setMoMsg('')
-    const price = parseFloat(mo.price)
-    const qty = parseFloat(mo.qty)
-    if (!qty || qty <= 0 || (mo.type === 'limit' && (!price || price <= 0))) {
-      setMoMsg('数量必须为正；限价单价格必须为正')
-      return
-    }
-    try {
-      const o = await api.manualOrder({ side: mo.side, type: mo.type, price: price || 0, qty })
-      setMoMsg(`已提交：${o.order_id ?? '(挂起)'}`)
-    } catch (e) {
-      setMoMsg(String(e).replace('Error: ', ''))
-    }
-  }
-
-  const cancelOne = async (orderId: string) => {
-    try {
-      await api.cancelOrder(orderId)
-    } catch (e) {
-      window.__lastCancelErr = String(e)
-    }
-  }
-
-  const runWF = async () => {
-    setWfRunning(true)
-    setWfErr('')
-    setWf(null)
-    try {
-      setWf(await api.researchWF({
-        strategy: rsStrategy,
-        train: parseInt(rsTrain) || 300,
-        test: parseInt(rsTest) || 100,
-      }))
-    } catch (e) {
-      setWfErr(String(e).replace('Error: ', ''))
-    } finally {
-      setWfRunning(false)
-    }
-  }
-
-  const runPlateauScan = async () => {
-    setPtRunning(true)
-    setPlateau(null)
-    setCostScan([])
-    try {
-      const [pt, cs] = await Promise.all([
-        api.researchPlateau({ strategy: rsStrategy }),
-        api.researchCostScan({ strategy: rsStrategy }),
-      ])
-      setPlateau(pt)
-      setCostScan(cs.points ?? [])
-    } catch (e) {
-      setPlateau({
-        base: { label: '', ret: 0 }, neighbors: [], median_ret: 0,
-        is_plateau: false, reason: String(e).replace('Error: ', ''),
-      })
-    } finally {
-      setPtRunning(false)
-    }
-  }
-
-  const runUMP = async () => {
-    setUmpRunning(true)
-    setUmpRes(null)
-    try {
-      setUmpRes(await api.researchUMP({ strategy: rsStrategy }))
-    } catch (e) {
-      setUmpRes({ trade_samples: 0, report: { usable: false, reason: String(e).replace('Error: ', '') } })
-    } finally {
-      setUmpRunning(false)
-    }
-  }
-
-  const switchStrategy = async (name: string) => {
-    setStratMsg('')
-    try {
-      await api.switchStrategy(name)
-      setStratMsg(`策略已切到 ${name}（无持仓时生效）`)
-    } catch (e) {
-      setStratMsg(String(e).replace('Error: ', ''))
-    }
-  }
 
   const switchTo = async (m: string) => {
     setModeMsg('')
@@ -223,27 +99,13 @@ export default function App() {
     }
   }
 
-  const trip = async () => {
-    const reason = tripReason.trim()
-    if (!reason) {
-      setKillMsg('必须填写触发原因（审计留痕）')
-      return
-    }
+  const switchStrategy = async (name: string) => {
+    setStratMsg('')
     try {
-      await api.killTrip(reason)
-      setTripReason('')
-      setKillMsg('已触发：撤单 + 停止一切新下单')
+      await api.switchStrategy(name)
+      setStratMsg(`策略已切到 ${name}（无持仓时生效）`)
     } catch (e) {
-      setKillMsg(`触发失败: ${e}`)
-    }
-  }
-
-  const reset = async () => {
-    try {
-      await api.killReset()
-      setKillMsg('已复位')
-    } catch (e) {
-      setKillMsg(`复位失败: ${e}`)
+      setStratMsg(String(e).replace('Error: ', ''))
     }
   }
 
@@ -315,7 +177,59 @@ export default function App() {
           </div>
         )}
       </header>
+      <nav className="pagenav">
+        <NavLink to="/" end>运行</NavLink>
+        <NavLink to="/research">研究</NavLink>
+        <NavLink to="/trade">交易台</NavLink>
+      </nav>
+      {children}
+    </div>
+  )
+}
 
+// RunPage 运行页：权益/风控/网格/Kill + K线 + 挂单/拒单 + 复盘 + 权益曲线
+function RunPage() {
+  const status = usePolling(api.status, 2000)
+  const orders = usePolling(api.orders, 3000)
+  const rejections = usePolling(api.rejections, 5000)
+  const [tf, setTf] = useState('1H')
+  const candles = usePolling(() => api.candles(tf), 15000)
+  const [grid, setGrid] = useState<{ levels?: number[]; stats?: GridStats }>({})
+  const [tripReason, setTripReason] = useState('')
+  const [killMsg, setKillMsg] = useState('')
+  const reviews = usePolling(() => api.reviews(5), 15000)
+  const equity = usePolling(api.equityCurve, 30000)
+
+  useEffect(() => {
+    api.grid().then(setGrid).catch(() => {})
+  }, [])
+
+  const trip = async () => {
+    const reason = tripReason.trim()
+    if (!reason) {
+      setKillMsg('必须填写触发原因（审计留痕）')
+      return
+    }
+    try {
+      await api.killTrip(reason)
+      setTripReason('')
+      setKillMsg('已触发：撤单 + 停止一切新下单')
+    } catch (e) {
+      setKillMsg(`触发失败: ${e}`)
+    }
+  }
+
+  const reset = async () => {
+    try {
+      await api.killReset()
+      setKillMsg('已复位')
+    } catch (e) {
+      setKillMsg(`复位失败: ${e}`)
+    }
+  }
+
+  return (
+    <>
       <section className="cards">
         <Card title="权益">
           {status ? (
@@ -469,6 +383,43 @@ export default function App() {
           )}
         </Card>
       </section>
+    </>
+  )
+}
+
+// TradePage 交易台：手动下单（走完整风控）+ 挂单撤单 + 成交历史
+function TradePage() {
+  const orders = usePolling(api.orders, 3000)
+  const fills = usePolling(api.fills, 5000)
+  const [mo, setMo] = useState({ side: 'buy', type: 'limit', price: '', qty: '' })
+  const [moMsg, setMoMsg] = useState('')
+
+  const submitManual = async () => {
+    setMoMsg('')
+    const price = parseFloat(mo.price)
+    const qty = parseFloat(mo.qty)
+    if (!qty || qty <= 0 || (mo.type === 'limit' && (!price || price <= 0))) {
+      setMoMsg('数量必须为正；限价单价格必须为正')
+      return
+    }
+    try {
+      const o = await api.manualOrder({ side: mo.side, type: mo.type, price: price || 0, qty })
+      setMoMsg(`已提交：${o.order_id ?? '(挂起)'}`)
+    } catch (e) {
+      setMoMsg(String(e).replace('Error: ', ''))
+    }
+  }
+
+  const cancelOne = async (orderId: string) => {
+    try {
+      await api.cancelOrder(orderId)
+    } catch (e) {
+      window.__lastCancelErr = String(e)
+    }
+  }
+
+  return (
+    <>
 
       <div className="row">
         <section>
@@ -543,7 +494,100 @@ export default function App() {
           </Card>
         </section>
       </div>
+    </>
+  )
+}
 
+// ResearchPage 研究页：回测 + 研究工作台（WF/UMP/参数高原/成本扫描）
+function ResearchPage() {
+  const [bt, setBt] = useState<BacktestResult | null>(null)
+  const [btRunning, setBtRunning] = useState(false)
+  const [btError, setBtError] = useState('')
+  const [rsStrategy, setRsStrategy] = useState('trend')
+  const [rsTrain, setRsTrain] = useState('300')
+  const [rsTest, setRsTest] = useState('100')
+  const [wf, setWf] = useState<WFReport | null>(null)
+  const [wfRunning, setWfRunning] = useState(false)
+  const [wfErr, setWfErr] = useState('')
+  const [umpRes, setUmpRes] = useState<{ trade_samples: number; report: { usable: boolean; reason: string } } | null>(null)
+  const [umpRunning, setUmpRunning] = useState(false)
+  const [plateau, setPlateau] = useState<{
+    base: { label: string; ret: number }
+    neighbors: { label: string; ret: number }[]
+    median_ret: number
+    is_plateau: boolean
+    reason: string
+  } | null>(null)
+  const [costScan, setCostScan] = useState<
+    { multiplier: number; ret: number; trades: number }[]
+  >([])
+  const [ptRunning, setPtRunning] = useState(false)
+
+  const runBacktest = async () => {
+    setBtRunning(true)
+    setBtError('')
+    try {
+      setBt(await api.backtest())
+    } catch (e) {
+      setBtError(String(e))
+    } finally {
+      setBtRunning(false)
+    }
+  }
+  const btDone = bt ? new Date(bt.sample_to).toLocaleString() : ''
+
+  const runWF = async () => {
+    setWfRunning(true)
+    setWfErr('')
+    setWf(null)
+    try {
+      setWf(await api.researchWF({
+        strategy: rsStrategy,
+        train: parseInt(rsTrain) || 300,
+        test: parseInt(rsTest) || 100,
+      }))
+    } catch (e) {
+      setWfErr(String(e).replace('Error: ', ''))
+    } finally {
+      setWfRunning(false)
+    }
+  }
+
+  const runPlateauScan = async () => {
+    setPtRunning(true)
+    setPlateau(null)
+    setCostScan([])
+    try {
+      const [pt, cs] = await Promise.all([
+        api.researchPlateau({ strategy: rsStrategy }),
+        api.researchCostScan({ strategy: rsStrategy }),
+      ])
+      setPlateau(pt)
+      setCostScan(cs.points ?? [])
+    } catch (e) {
+      setPlateau({
+        base: { label: '', ret: 0 }, neighbors: [], median_ret: 0,
+        is_plateau: false, reason: String(e).replace('Error: ', ''),
+      })
+    } finally {
+      setPtRunning(false)
+    }
+  }
+
+  const runUMP = async () => {
+    setUmpRunning(true)
+    setUmpRes(null)
+    try {
+      setUmpRes(await api.researchUMP({ strategy: rsStrategy }))
+    } catch (e) {
+      setUmpRes({ trade_samples: 0, report: { usable: false, reason: String(e).replace('Error: ', '') } })
+    } finally {
+      setUmpRunning(false)
+    }
+  }
+
+  return (
+    <>
       <section className="wide">
         <Card
           title="回测"
@@ -679,9 +723,10 @@ export default function App() {
           {!wf && !umpRes && !wfErr && <div className="sub">walk-forward 样本外验证与 UMP 拦截器验证（需先 fetch 长历史）</div>}
         </Card>
       </section>
-    </div>
+    </>
   )
 }
+
 
 function ModeSwitcher({
   info,
