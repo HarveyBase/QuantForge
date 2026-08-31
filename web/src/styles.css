@@ -247,3 +247,14 @@ td.reason { max-width: 320px; }
   font: 12px/1.5 monospace; color: #d7dee9; pointer-events: none;
   background: rgba(15, 20, 32, 0.75); padding: 3px 8px; border-radius: 4px;
 }
+
+
+.manual-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 6px; margin-bottom: 8px; }
+.manual-grid input, .manual-grid select {
+  padding: 6px 8px; border-radius: 6px; border: 1px solid #2a3a52;
+  background: #0f1420; color: #d7dee9; font-size: 13px;
+}
+.manual-grid button { padding: 6px 14px; cursor: pointer; }
+.order-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; gap: 8px; }
+.order-row button { padding: 2px 10px; font-size: 12px; cursor: pointer; }
+.up-btn { background: #14532d; color: #4ade80; border: 1px solid #22c55e; border-radius: 6px; }

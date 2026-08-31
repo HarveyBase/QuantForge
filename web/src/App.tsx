@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, streamURL } from './api'
-import type { ModeInfo, ReviewRecord } from './api'
+import type { FillEvent, ModeInfo, ReviewRecord } from './api'
 import type { BacktestResult, Candle, GridStats, Order, Rejection } from './types'
 
 declare global {
   interface Window {
     __liveConfirmValue?: string
+    __lastCancelErr?: string
   }
 }
 
@@ -56,6 +57,10 @@ export default function App() {
   const modeInfo = usePolling(api.mode, 5000)
   const [modeMsg, setModeMsg] = useState('')
   const reviews = usePolling(() => api.reviews(5), 15000)
+  const fills = usePolling(api.fills, 5000)
+  const equity = usePolling(api.equityCurve, 30000)
+  const [mo, setMo] = useState({ side: 'buy', type: 'limit', price: '', qty: '' })
+  const [moMsg, setMoMsg] = useState('')
 
   useEffect(() => {
     api.grid().then(setGrid).catch(() => {})
@@ -84,6 +89,30 @@ export default function App() {
     }
   }
   const btDone = bt ? new Date(bt.sample_to).toLocaleString() : ''
+
+  const submitManual = async () => {
+    setMoMsg('')
+    const price = parseFloat(mo.price)
+    const qty = parseFloat(mo.qty)
+    if (!qty || qty <= 0 || (mo.type === 'limit' && (!price || price <= 0))) {
+      setMoMsg('数量必须为正；限价单价格必须为正')
+      return
+    }
+    try {
+      const o = await api.manualOrder({ side: mo.side, type: mo.type, price: price || 0, qty })
+      setMoMsg(`已提交：${o.order_id ?? '(挂起)'}`)
+    } catch (e) {
+      setMoMsg(String(e).replace('Error: ', ''))
+    }
+  }
+
+  const cancelOne = async (orderId: string) => {
+    try {
+      await api.cancelOrder(orderId)
+    } catch (e) {
+      window.__lastCancelErr = String(e)
+    }
+  }
 
   const switchTo = async (m: string) => {
     setModeMsg('')
@@ -299,6 +328,90 @@ export default function App() {
       </section>
 
       <section className="wide">
+        <Card title={`权益曲线（${equity?.points?.length ?? 0} 个复盘点）`}>
+          {equity?.points && equity.points.length >= 2 ? (
+            <EquityChart points={equity.points} />
+          ) : (
+            <div className="sub">复盘点不足（服务运行满一个复盘周期后出现）</div>
+          )}
+        </Card>
+      </section>
+
+      <div className="row">
+        <section>
+          <Card title={`成交历史（${fills?.fills?.length ?? 0}）`}>
+            {fills?.fills && fills.fills.length > 0 ? (
+              <table>
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>方向</th>
+                    <th>数量</th>
+                    <th>价格</th>
+                    <th>订单</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {fills.fills.slice(0, 20).map((f: FillEvent) => (
+                    <tr key={f.ts + f.order.order_id}>
+                      <td>{new Date(f.ts).toLocaleTimeString()}</td>
+                      <td className={f.order.side === 'buy' ? 'up' : 'down'}>{f.order.side}</td>
+                      <td>{f.delta_qty}</td>
+                      <td>{f.delta_price}</td>
+                      <td>{f.order.order_id}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="sub">暂无成交</div>
+            )}
+          </Card>
+        </section>
+        <section>
+          <Card title="手动交易台（走完整风控）">
+            <div className="manual-grid">
+              <select value={mo.side} onChange={(e) => setMo({ ...mo, side: e.target.value })}>
+                <option value="buy">买入</option>
+                <option value="sell">卖出</option>
+              </select>
+              <select value={mo.type} onChange={(e) => setMo({ ...mo, type: e.target.value })}>
+                <option value="limit">限价</option>
+                <option value="market">市价</option>
+              </select>
+              <input
+                placeholder={mo.type === 'limit' ? '价格' : '价格（市价忽略）'}
+                value={mo.price}
+                disabled={mo.type === 'market'}
+                onChange={(e) => setMo({ ...mo, price: e.target.value })}
+              />
+              <input
+                placeholder="数量（BTC）"
+                value={mo.qty}
+                onChange={(e) => setMo({ ...mo, qty: e.target.value })}
+              />
+              <button className={mo.side === 'buy' ? 'up-btn' : 'danger'} onClick={submitManual}>
+                提交订单
+              </button>
+            </div>
+            {moMsg && <div className="sub">{moMsg}</div>}
+            <div className="sub">挂单列表每行可单独撤单：</div>
+            {orders?.orders?.map((o) => (
+              <div className="order-row" key={o.order_id}>
+                <span className={o.side === 'buy' ? 'up' : 'down'}>
+                  {o.side} {o.qty} @ {o.price}（{o.status}）
+                </span>
+                <button onClick={() => cancelOne(o.order_id)}>撤单</button>
+              </div>
+            ))}
+            {window.__lastCancelErr && (
+              <div className="sub warn">撤单失败: {window.__lastCancelErr}</div>
+            )}
+          </Card>
+        </section>
+      </div>
+
+      <section className="wide">
         <Card
           title="回测"
           action={
@@ -456,6 +569,35 @@ function RejectionsTable({ rejections }: { rejections: Rejection[] }) {
         ))}
       </tbody>
     </table>
+  )
+}
+
+function EquityChart({ points }: { points: { ts: number; equity: number }[] }) {
+  const w = 900
+  const h = 180
+  const pad = 30
+  const eqs = points.map((p) => p.equity)
+  const min = Math.min(...eqs)
+  const max = Math.max(...eqs)
+  const span = max - min || 1
+  const xs = (i: number) => pad + (i / Math.max(points.length - 1, 1)) * (w - pad * 2)
+  const ys = (v: number) => pad + (1 - (v - min) / span) * (h - pad * 2)
+  const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xs(i)},${ys(p.equity)}`).join(' ')
+  const up = eqs[eqs.length - 1] >= eqs[0]
+  return (
+    <svg width="100%" viewBox={`0 0 ${w} ${h}`} style={{ display: 'block' }}>
+      <path
+        d={path}
+        fill="none"
+        stroke={up ? '#22c55e' : '#ef4444'}
+        strokeWidth="1.5"
+      />
+      <text x={pad} y={pad - 8} fill="#9aa4b2" fontSize="10">{fmt(max)}</text>
+      <text x={pad} y={h - 8} fill="#9aa4b2" fontSize="10">{fmt(min)}</text>
+      <text x={w - pad - 60} y={pad - 8} fill={up ? '#22c55e' : '#ef4444'} fontSize="11">
+        {up ? '+' : ''}{(((eqs[eqs.length - 1] / eqs[0]) - 1) * 100).toFixed(2)}%
+      </text>
+    </svg>
   )
 }
 

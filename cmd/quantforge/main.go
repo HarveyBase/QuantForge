@@ -28,6 +28,7 @@ import (
 	"github.com/HarveyBase/QuantForge/grid"
 	"github.com/HarveyBase/QuantForge/lab"
 	"github.com/HarveyBase/QuantForge/market"
+	"github.com/HarveyBase/QuantForge/notify"
 	"github.com/HarveyBase/QuantForge/portfolio"
 	"github.com/HarveyBase/QuantForge/regime"
 	"github.com/HarveyBase/QuantForge/review"
@@ -101,6 +102,7 @@ type app struct {
 	regimeDet  *regime.Detector   // 市况识别（信息面：震荡/趋势留痕，自动路由待回测证据）
 	store      *state.Store       // 运行态持久化：重启恢复游标/试验数/Kill 状态
 	candlesDB  *candlestore.Store // SQLite K 线缓存库（fetch 历史 + 实时收盘增量统一入库）
+	notifier   notify.Notifier    // 告警通道（Telegram，env 缺省时仅日志）
 	umpFilter  *ump.Filter        // grid 买信号拦截器（启动自举+运行累积；已过样本外验证 docs/10 §5B）
 	umpOn      bool               // 拦截开关（config.ump.enabled，默认开：拦截只减少下单不增加风险）
 	umpBlocked atomic.Int64       // 窗口内拦截计数（复盘留痕）
@@ -195,6 +197,11 @@ func buildApp(cfg *config.Config) (*app, error) {
 	} else {
 		log.Printf("K 线库打开失败（图表将回退内存缓存）: %v", derr)
 	}
+	// 告警通道：Kill/断流/连续拒单/复盘严重项 → Telegram（无凭据自动退化为日志）
+	a.notifier = notify.NewFromEnv(cfg.Mode, cfg.Exchange.InstID)
+	rk.Kill.OnTrip(func(reason string) {
+		a.notifier.Send(fmt.Sprintf("Kill Switch 触发：%s（已自动撤单，人工复位前禁止一切新下单）", reason))
+	})
 	// 运行态恢复：游标（防重启重复驱动策略）、试验计数、Kill Switch 状态
 	a.store = state.New(cfg.DataDir)
 	if st, err := a.store.Load(); err != nil {
@@ -448,6 +455,17 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 	}
 	go a.pol.Run(ctx, 300, pollEvery)
 
+	// WS 行情触发器：收到已收盘 K 线即时拉取校验（秒级响应）；
+	// 数据纪律：WS 只触发，入库与策略驱动仍走 REST 校验链（docs/02）。
+	go okx.NewWSCandles(cfg.Exchange.InstID, cfg.Trading.Interval).WithHandler(
+		func(ts int64) {
+			if _, err := a.pol.FetchOnce(ctx, 300); err != nil {
+				log.Printf("ws 触发拉取失败（等下一轮轮询兜底）: %v", err)
+			}
+		},
+		func(err error) { log.Printf("%v", err) },
+	).Run(ctx)
+
 	if a.exec != nil {
 		go a.exec.ReconcileLoop()
 	}
@@ -466,10 +484,14 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 				a.reviewing.Store(false)
 				if err != nil {
 					log.Printf("复盘失败: %v", err)
+					a.notifier.Send(fmt.Sprintf("复盘失败：%v（复盘管道异常，需排查）", err))
 					continue
 				}
 				log.Printf("复盘完成 %s：窗口收益 %+.2f%% 买入持有 %+.2f%% 成交 %d 拒单 %d（%s）",
 					rec.Ts.Format("15:04"), rec.WindowRetPct, rec.PriceChgPct, len(rec.Fills), len(rec.Rejections), rec.Stage)
+				for _, crit := range notify.Critical(*rec) {
+					a.notifier.Send(crit)
+				}
 			}
 		}
 	}()
@@ -487,6 +509,24 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 		return append([]exchange.Candle(nil), a.candles...)
 	}, runBacktest)
 	srv.RecentReviews = a.reviewer.Recent
+	srv.Fills = func() []execution.Event {
+		var out []execution.Event
+		for _, ev := range a.exec.Events(500) {
+			if ev.DeltaQty > 0 {
+				out = append(out, ev)
+			}
+		}
+		return out
+	}
+	srv.EquityCurve = func() []review.Record { return a.reviewer.Recent(72) }
+	if a.exec != nil {
+		srv.CancelOrder = func(ctx context.Context, id string) error {
+			return a.exec.Cancel(ctx, cfg.Exchange.InstID, id)
+		}
+		srv.PlaceOrder = func(ctx context.Context, req exchange.OrderRequest) (exchange.Order, error) {
+			return a.exec.Submit(ctx, req) // 完整风控路径（限额/频率/现金/Kill 全部生效）
+		}
+	}
 	srv.Candles = func(interval string, limit int) []exchange.Candle {
 		if interval == "" {
 			interval = cfg.Trading.Interval

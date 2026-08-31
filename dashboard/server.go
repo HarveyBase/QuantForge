@@ -17,6 +17,7 @@ import (
 	"github.com/HarveyBase/QuantForge/backtest"
 	"github.com/HarveyBase/QuantForge/config"
 	"github.com/HarveyBase/QuantForge/exchange"
+	"github.com/HarveyBase/QuantForge/execution"
 	"github.com/HarveyBase/QuantForge/grid"
 	"github.com/HarveyBase/QuantForge/portfolio"
 	"github.com/HarveyBase/QuantForge/regime"
@@ -35,8 +36,12 @@ type Server struct {
 	Snapshots     func() []exchange.Candle                           // 最近已确认 K 线
 	Candles       func(interval string, limit int) []exchange.Candle // SQLite 库读取（任意周期/全历史）
 	RunBacktest   func(ctx context.Context) (*backtest.Result, error)
-	RecentReviews func(n int) []review.Record // 最近 n 份小时复盘
-	Regime        func() regime.Reading       // 当前市况读数
+	RecentReviews func(n int) []review.Record                                                  // 最近 n 份小时复盘
+	Regime        func() regime.Reading                                                        // 当前市况读数
+	Fills         func() []execution.Event                                                     // 成交历史（事件流过滤）
+	EquityCurve   func() []review.Record                                                       // 权益曲线数据源（复盘记录聚合）
+	CancelOrder   func(ctx context.Context, id string) error                                   // 手动撤单
+	PlaceOrder    func(ctx context.Context, req exchange.OrderRequest) (exchange.Order, error) // 手动下单（走风控）
 	// ModeSwap 页面热切活跃环境（research↔paper；live 受启动配置门禁，见 cmd.SwitchMode）
 	ActiveMode func() config.Mode // 当前活跃环境
 	BootMode   config.Mode        // 启动配置环境（能力上界）
@@ -90,6 +95,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/killswitch", s.auth(s.handleKillSwitch))
 	mux.HandleFunc("POST /api/backtest", s.auth(s.handleBacktest))
 	mux.HandleFunc("GET /api/reviews", s.auth(s.handleReviews))
+	mux.HandleFunc("GET /api/fills", s.auth(s.handleFills))
+	mux.HandleFunc("GET /api/equitycurve", s.auth(s.handleEquityCurve))
+	mux.HandleFunc("POST /api/cancel", s.auth(s.handleCancel))
+	mux.HandleFunc("POST /api/order", s.auth(s.handleManualOrder))
 	mux.HandleFunc("GET /api/config", s.auth(s.handleConfig))
 	mux.HandleFunc("GET /api/stream", s.auth(s.handleSSE))
 	mux.HandleFunc("GET /", s.handleStatic)
@@ -344,6 +353,94 @@ func (s *Server) handleReviews(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, map[string]any{"reviews": s.RecentReviews(n)})
+}
+
+// handleFills 成交历史（最近 200 条成交事件）。
+func (s *Server) handleFills(w http.ResponseWriter, r *http.Request) {
+	if s.Fills == nil {
+		writeJSON(w, map[string]any{"fills": []execution.Event{}})
+		return
+	}
+	fills := s.Fills()
+	if fills == nil {
+		fills = []execution.Event{}
+	}
+	writeJSON(w, map[string]any{"fills": fills})
+}
+
+// handleEquityCurve 权益曲线（复盘记录逐点：时间+权益）。
+func (s *Server) handleEquityCurve(w http.ResponseWriter, r *http.Request) {
+	type point struct {
+		Ts     int64   `json:"ts"`
+		Equity float64 `json:"equity"`
+	}
+	if s.EquityCurve == nil {
+		writeJSON(w, map[string]any{"points": []point{}})
+		return
+	}
+	var out []point
+	for _, rec := range s.EquityCurve() {
+		out = append(out, point{Ts: rec.Ts.UnixMilli(), Equity: rec.Equity})
+	}
+	if out == nil {
+		out = []point{}
+	}
+	// 复盘倒序 → 时间升序
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	writeJSON(w, map[string]any{"points": out})
+}
+
+// handleCancel 手动撤单（应急控制：research 模式无执行器时报 503）。
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	if s.CancelOrder == nil {
+		http.Error(w, "本环境无执行器（撤单不可用）", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.OrderID == "" {
+		http.Error(w, "order_id 必填", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := s.CancelOrder(ctx, req.OrderID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.Broadcast("cancel", map[string]any{"order_id": req.OrderID})
+	writeJSON(w, map[string]any{"cancelled": req.OrderID})
+}
+
+// handleManualOrder 手动下单：必须走完整风控（限额/频率/现金校验），不得绕过。
+func (s *Server) handleManualOrder(w http.ResponseWriter, r *http.Request) {
+	if s.PlaceOrder == nil {
+		http.Error(w, "本环境无执行器（手动下单不可用）", http.StatusServiceUnavailable)
+		return
+	}
+	if s.ActiveMode != nil && s.ActiveMode() == config.ModeResearch {
+		http.Error(w, "研究环境不下单（先切到模拟盘/实盘）", http.StatusForbidden)
+		return
+	}
+	var req exchange.OrderRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "请求体非法", http.StatusBadRequest)
+		return
+	}
+	req.Symbol = s.Cfg.Exchange.InstID
+	req.ClientOrderID = fmt.Sprintf("manual-%d", time.Now().UnixNano())
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	o, err := s.PlaceOrder(ctx, req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.Broadcast("manual_order", map[string]any{"order_id": o.OrderID})
+	writeJSON(w, o)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {

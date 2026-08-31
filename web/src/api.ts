@@ -57,6 +57,21 @@ export const api = {
   switchMode: (mode: string, confirm?: string) =>
     post('/api/mode', { mode, confirm: confirm ?? '' }),
   reviews: (n = 10) => get<{ reviews: ReviewRecord[] }>(`/api/reviews?n=${n}`),
+  fills: () => get<{ fills: FillEvent[] }>('/api/fills'),
+  equityCurve: () =>
+    get<{ points: { ts: number; equity: number }[] }>('/api/equitycurve'),
+  cancelOrder: (orderId: string) =>
+    post<{ cancelled: string }>('/api/cancel', { order_id: orderId }),
+  manualOrder: (o: { side: string; type: string; price: number; qty: number }) =>
+    post<{ order_id: string }>('/api/order', o),
+}
+
+export interface FillEvent {
+  ts: string
+  kind: string
+  order: { order_id: string; symbol: string; side: string }
+  delta_qty: number
+  delta_price: number
 }
 
 export interface ModeInfo {

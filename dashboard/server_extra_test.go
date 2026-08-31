@@ -13,6 +13,7 @@ import (
 	"github.com/HarveyBase/QuantForge/backtest"
 	"github.com/HarveyBase/QuantForge/config"
 	"github.com/HarveyBase/QuantForge/exchange"
+	"github.com/HarveyBase/QuantForge/execution"
 	"github.com/HarveyBase/QuantForge/grid"
 	"github.com/HarveyBase/QuantForge/portfolio"
 	"github.com/HarveyBase/QuantForge/review"
@@ -430,5 +431,117 @@ func TestModeSwitchPermissionMatrix(t *testing.T) {
 	// 未知环境
 	if c := post(s4, `{"mode":"yolo"}`); c != 403 {
 		t.Fatalf("未知环境应 403: %d", c)
+	}
+}
+
+func TestFillsEquityCurveEndpoints(t *testing.T) {
+	s := newServerForTest(t)
+	s.Fills = func() []execution.Event {
+		return []execution.Event{{Kind: "filled", DeltaQty: 0.5, DeltaPrice: 100, Order: exchange.Order{OrderID: "o1", Side: exchange.Buy}}}
+	}
+	s.EquityCurve = func() []review.Record { // Recent 语义：最新在前
+		return []review.Record{
+			{Ts: time.Now(), Equity: 110},
+			{Ts: time.Now().Add(-time.Hour), Equity: 100},
+		}
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	resp, _ := http.Get(srv.URL + "/api/fills")
+	var fb struct {
+		Fills []execution.Event `json:"fills"`
+	}
+	json.NewDecoder(resp.Body).Decode(&fb)
+	resp.Body.Close()
+	if len(fb.Fills) != 1 || fb.Fills[0].DeltaQty != 0.5 {
+		t.Fatalf("fills 端点错误: %+v", fb)
+	}
+	resp2, _ := http.Get(srv.URL + "/api/equitycurve")
+	var eb struct {
+		Points []struct {
+			Ts     int64   `json:"ts"`
+			Equity float64 `json:"equity"`
+		} `json:"points"`
+	}
+	json.NewDecoder(resp2.Body).Decode(&eb)
+	resp2.Body.Close()
+	if len(eb.Points) != 2 || eb.Points[0].Equity != 100 || eb.Points[1].Equity != 110 {
+		t.Fatalf("equitycurve 应升序: %+v", eb.Points)
+	}
+	// nil 注入安全
+	s.Fills = nil
+	s.EquityCurve = nil
+	r3, _ := http.Get(srv.URL + "/api/fills")
+	r3.Body.Close()
+	if r3.StatusCode != 200 {
+		t.Fatalf("nil fills 应安全: %d", r3.StatusCode)
+	}
+}
+
+func TestManualOrderAndCancel(t *testing.T) {
+	s := newServerForTest(t)
+	placed := make(chan exchange.OrderRequest, 1)
+	cancelled := make(chan string, 1)
+	s.PlaceOrder = func(ctx context.Context, req exchange.OrderRequest) (exchange.Order, error) {
+		placed <- req
+		return exchange.Order{OrderID: "ok-1"}, nil
+	}
+	s.CancelOrder = func(ctx context.Context, id string) error {
+		cancelled <- id
+		return nil
+	}
+	s.ActiveMode = func() config.Mode { return config.ModePaper } // 活跃模拟盘
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	// 下单：research 拒
+	s.ActiveMode = func() config.Mode { return config.ModeResearch }
+	r1, _ := http.Post(srv.URL+"/api/order", "application/json", strings.NewReader(`{"side":"buy","type":"market","qty":0.001}`))
+	r1.Body.Close()
+	if r1.StatusCode != 403 {
+		t.Fatalf("研究环境手动下单应 403: %d", r1.StatusCode)
+	}
+	// 下单：paper 通过
+	s.ActiveMode = func() config.Mode { return config.ModePaper }
+	r2, _ := http.Post(srv.URL+"/api/order", "application/json", strings.NewReader(`{"side":"buy","type":"market","qty":0.001}`))
+	var o exchange.Order
+	json.NewDecoder(r2.Body).Decode(&o)
+	r2.Body.Close()
+	if o.OrderID != "ok-1" {
+		t.Fatalf("手动下单失败: %+v", o)
+	}
+	select {
+	case req := <-placed:
+		if req.Symbol != "BTC-USDT" || req.ClientOrderID == "" {
+			t.Fatalf("下单参数缺失: %+v", req)
+		}
+	default:
+		t.Fatal("PlaceOrder 未被调用")
+	}
+	// 撤单
+	r3, _ := http.Post(srv.URL+"/api/cancel", "application/json", strings.NewReader(`{"order_id":"ok-1"}`))
+	r3.Body.Close()
+	if r3.StatusCode != 200 {
+		t.Fatalf("撤单失败: %d", r3.StatusCode)
+	}
+	select {
+	case id := <-cancelled:
+		if id != "ok-1" {
+			t.Fatalf("撤单 ID 错误: %s", id)
+		}
+	default:
+		t.Fatal("CancelOrder 未被调用")
+	}
+	// 空 order_id 拒
+	r4, _ := http.Post(srv.URL+"/api/cancel", "application/json", strings.NewReader(`{}`))
+	r4.Body.Close()
+	if r4.StatusCode != 400 {
+		t.Fatalf("空 order_id 应 400: %d", r4.StatusCode)
+	}
+	// 无执行器 503
+	s.PlaceOrder = nil
+	r5, _ := http.Post(srv.URL+"/api/order", "application/json", strings.NewReader(`{"side":"buy","type":"market","qty":0.001}`))
+	r5.Body.Close()
+	if r5.StatusCode != 503 {
+		t.Fatalf("无执行器应 503: %d", r5.StatusCode)
 	}
 }
