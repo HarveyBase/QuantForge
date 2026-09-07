@@ -21,3 +21,20 @@ jobs:
         run: go test ./... -race -coverprofile=cover.out
       - name: Coverage summary
         run: go tool cover -func=cover.out | tail -1
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Build (typecheck + vite build)
+        run: npm run build
