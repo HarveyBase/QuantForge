@@ -1,7 +1,8 @@
 // clock.go OKX 时钟偏移校准：签名时间戳统一走 c.now() = 本地 UTC + offset。
 // 本地时钟漂移超过签名窗口（约 5s）会导致所有私有接口签名校验失败（静默拒绝），
 // 启动后应调用 CalibrateClock 校准一次；构造函数不做网络 IO，
-// 首次私有（签名）请求前会自动尝试校准一次（尽力而为，失败忽略）。
+// 首次私有（签名）请求前会自动尝试校准（尽力而为，失败不阻断请求，
+// 且失败不消费——下次签名请求会重新尝试，成功后不再触发）。
 package okx
 
 import (
@@ -71,16 +72,20 @@ func (c *Client) now() time.Time {
 // （建议阈值：|offset| > 3000ms 视为偏移过大）。
 func (c *Client) ClockOffsetMS() int64 { return c.clockOffset.Load() }
 
-// ensureClockCalibrated 首次私有（签名）请求前自动校准一次，尽力而为：
+// ensureClockCalibrated 首次私有（签名）请求前自动校准，尽力而为：
 // 失败仅放弃本次尝试（offset 保持 0，与未校准现状一致），不阻断请求；
-// 手动 CalibrateClock 成功后不再触发。
+// CAS 抢占保证并发下最多一个校准在跑（lazy 校准最多一次并发）；
+// 失败不消费——calibrating 置回 false，下次签名请求可重新尝试校准。
+// 手动 CalibrateClock 成功后（calibrated=true）不再触发。
 func (c *Client) ensureClockCalibrated() {
 	if c.calibrated.Load() {
 		return
 	}
-	c.calibrateOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = c.CalibrateClock(ctx) // 失败忽略：是否重试由调用方决定
-	})
+	if !c.calibrating.CompareAndSwap(false, true) {
+		return // 已有并发校准在跑
+	}
+	defer c.calibrating.Store(false) // 无论成败都释放：失败后下次签名请求可重试
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = c.CalibrateClock(ctx) // 失败忽略：由下次签名请求重试
 }

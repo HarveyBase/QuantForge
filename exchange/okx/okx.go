@@ -46,10 +46,10 @@ type Client struct {
 	cacheMu    sync.Mutex
 	contracts  map[string]float64
 
-	limiter       *rateLimiter // REST 限速器（do 入口 acquire；nil = 不限速，构造函数默认 10 req/s）
-	clockOffset   atomic.Int64 // 与 OKX 服务器时钟偏移（毫秒），签名时间戳用
-	calibrated    atomic.Bool  // 时钟是否已成功校准
-	calibrateOnce sync.Once    // 首次签名请求前的自动校准只做一次
+	limiter     *rateLimiter // REST 限速器（do 入口 acquire；nil = 不限速，构造函数默认 10 req/s）
+	clockOffset atomic.Int64 // 与 OKX 服务器时钟偏移（毫秒），签名时间戳用
+	calibrated  atomic.Bool  // 时钟是否已成功校准
+	calibrating atomic.Bool  // lazy 校准进行中标记（CAS 抢占；失败即释放，下次可重试）
 }
 
 // NewLive 生产环境客户端，Key 从环境变量读取。

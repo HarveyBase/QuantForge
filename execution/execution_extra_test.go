@@ -25,6 +25,9 @@ type fakeEx struct {
 	byClient map[string]exchange.Order
 	// orders GetOrder 返回表
 	orders map[string]exchange.Order
+	// getOrderSeq 依次返回的 GetOrder 回报序列（非空时优先；耗尽后回退 orders 表），
+	// 模拟交易所读副本最终一致/乱序回报
+	getOrderSeq map[string][]exchange.Order
 	// openErr GetOpenOrders 错误
 	openErr error
 	open    []exchange.Order
@@ -84,6 +87,11 @@ func (f *fakeEx) GetOrder(ctx context.Context, symbol, orderID string) (exchange
 	if err := f.getOrderErr[orderID]; err != nil {
 		return exchange.Order{}, err
 	}
+	if seq := f.getOrderSeq[orderID]; len(seq) > 0 {
+		o := seq[0]
+		f.getOrderSeq[orderID] = seq[1:]
+		return o, nil
+	}
 	o, ok := f.orders[orderID]
 	if !ok {
 		return exchange.Order{}, errors.New("order not found")
@@ -117,6 +125,9 @@ func newFakeExecutor(t *testing.T, fe *fakeEx, seedCash float64) *Executor {
 	}
 	if fe.getOrderErr == nil {
 		fe.getOrderErr = map[string]error{}
+	}
+	if fe.getOrderSeq == nil {
+		fe.getOrderSeq = map[string][]exchange.Order{}
 	}
 	pf := portfolio.New(seedCash)
 	rk := risk.NewManager(risk.Limits{
@@ -485,5 +496,100 @@ func TestApplyUpdateUnknownOrderIgnored(t *testing.T) {
 	e.applyUpdate(exchange.Order{OrderID: "ghost", Status: exchange.StatusFilled}) // 未知订单应被忽略
 	if len(e.OpenOrders()) != 0 {
 		t.Fatal("未知订单不得进入订单簿")
+	}
+}
+
+// filledTo 复制订单并设置状态/成交，构造 GetOrder 回报。
+func filledTo(o exchange.Order, st exchange.OrderStatus, fill float64) exchange.Order {
+	o.Status = st
+	o.FilledQty = fill
+	o.AvgPrice = 100
+	return o
+}
+
+// TestApplyUpdateRejectsStaleFillReport BUG-1：交易所读副本最终一致返回旧值/乱序回报
+// （FilledQty 回退）必须整条忽略——不写内存、不落 journal、不 applyDelta；
+// 账本只入账真实增量，订单不失联。与 journal 重放侧守卫逐点对齐。
+func TestApplyUpdateRejectsStaleFillReport(t *testing.T) {
+	fe := &fakeEx{}
+	e := newFakeExecutor(t, fe, 10000)
+	o, err := e.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 100, Qty: 1, ClientOrderID: "stale-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// GetOrder 序列：0.5（真实部分成交）→ 0（旧副本）→ 0.5（重复回报）
+	fe.getOrderSeq[o.OrderID] = []exchange.Order{
+		filledTo(o, exchange.StatusPartiallyFilled, 0.5),
+		filledTo(o, exchange.StatusPartiallyFilled, 0),
+		filledTo(o, exchange.StatusPartiallyFilled, 0.5),
+	}
+	for i := 0; i < 3; i++ {
+		e.ReconcileOnce(context.Background())
+	}
+	_, positions, _ := e.Pf.Snapshot()
+	var qty float64
+	for _, p := range positions {
+		if p.Symbol == "BTC-USDT" {
+			qty = p.Qty
+		}
+	}
+	if qty != 0.5 {
+		t.Fatalf("乱序回报必须整条忽略：账本只应入账 0.5, got %v", qty)
+	}
+	if opens := e.OpenOrders(); len(opens) != 1 || opens[0].OrderID != o.OrderID {
+		t.Fatalf("订单不得失联: %+v", opens)
+	}
+}
+
+// TestApplyUpdateRejectsStaleTerminalReport BUG-1 附带：乱序终态回报（成交数回退）同样
+// 忽略——不提前 releaseFreeze、订单不失联，等真正的终态回报再离场。
+func TestApplyUpdateRejectsStaleTerminalReport(t *testing.T) {
+	fe := &fakeEx{}
+	e := newFakeExecutor(t, fe, 10000)
+	o, err := e.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 100, Qty: 1, ClientOrderID: "stale-2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fe.getOrderSeq[o.OrderID] = []exchange.Order{
+		filledTo(o, exchange.StatusPartiallyFilled, 0.5), // 真实部分成交
+		filledTo(o, exchange.StatusFilled, 0.2),          // 乱序终态：FilledQty 回退
+	}
+	e.ReconcileOnce(context.Background())
+	cashBefore, _, _ := e.Pf.Snapshot() // 冻结剩余 0.5 手：cash = 10000 - 100 + 50(成交解冻) - 50(成交扣款)
+
+	e.ReconcileOnce(context.Background()) // 乱序终态回报必须被忽略
+	cashAfter, _, _ := e.Pf.Snapshot()
+	if cashAfter != cashBefore {
+		t.Fatalf("乱序终态回报不得提前释放冻结: %v -> %v", cashBefore, cashAfter)
+	}
+	if opens := e.OpenOrders(); len(opens) != 1 || opens[0].OrderID != o.OrderID {
+		t.Fatalf("乱序终态回报不得使订单失联: %+v", opens)
+	}
+}
+
+// TestDuplicateOrderErrClassification NIT：duplicateOrderErr 覆盖 OKX 重复单 sCode 51016。
+func TestDuplicateOrderErrClassification(t *testing.T) {
+	yes := []error{
+		errors.New("okx sCode 51016: Duplicated clientOrderID"),
+		errors.New("order already exists"),
+		errors.New("client order duplicated"),
+		errors.New("重复下单"),
+	}
+	for _, err := range yes {
+		if !duplicateOrderErr(err) {
+			t.Errorf("应判定为重复单错误: %v", err)
+		}
+	}
+	no := []error{nil, errors.New("insufficient balance"), errors.New("rate limit 50011")}
+	for _, err := range no {
+		if duplicateOrderErr(err) {
+			t.Errorf("不应判定为重复单错误: %v", err)
+		}
 	}
 }

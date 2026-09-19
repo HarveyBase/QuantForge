@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -104,5 +105,50 @@ func TestLazyCalibrationOnFirstSignedRequest(t *testing.T) {
 	}
 	if d := sigTS.UnixMilli() - time.Now().UnixMilli(); d < delta-500 || d > delta+500 {
 		t.Fatalf("签名时间戳应使用校准后时钟（+%dms），偏差 %dms", delta, d)
+	}
+}
+
+// RISK-3：lazy 校准失败不消费——下次签名请求重新尝试自动校准并成功
+// （保持"do() 内 lazy 校准最多一次并发"语义：CAS 抢占，完成后置回）。
+func TestLazyCalibrationRetriesAfterFailure(t *testing.T) {
+	const delta = int64(1500)
+	var hits atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v5/public/time", func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError) // 首次校准失败
+			return
+		}
+		fmt.Fprintf(w, `{"code":"0","msg":"","data":[{"ts":"%d"}]}`, time.Now().UnixMilli()+delta)
+	})
+	mux.HandleFunc("/api/v5/trade/order", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"code":"0","data":[{"ordId":"1","sCode":"0"}]}`))
+	})
+	c := newMockClient(t, mux)
+	c.APIKey, c.Secret, c.Passphrase = "k", "s", "p"
+
+	// 第一次签名请求：自动校准失败（忽略、不阻断），calibrating 必须已释放
+	if _, err := c.PlaceOrder(context.Background(), mustReq()); err != nil {
+		t.Fatalf("校准失败不应阻断签名请求: %v", err)
+	}
+	if c.calibrated.Load() {
+		t.Fatal("首次校准失败后不应标记已校准")
+	}
+	if c.calibrating.Load() {
+		t.Fatal("校准失败后必须释放 calibrating 标记（下次才能重试）")
+	}
+
+	// 第二次签名请求：重新尝试校准并成功
+	if _, err := c.PlaceOrder(context.Background(), mustReq()); err != nil {
+		t.Fatal(err)
+	}
+	if !c.calibrated.Load() {
+		t.Fatal("校准失败后第二次签名请求应重新尝试并完成校准")
+	}
+	if off := c.ClockOffsetMS(); off < delta-500 || off > delta+500 {
+		t.Fatalf("重试校准 offset 应≈%dms, got %dms", delta, off)
+	}
+	if hits.Load() != 1+clockCalibrateSamples {
+		t.Fatalf("应重试校准（1 次失败 + %d 次采样）, got %d 次请求", clockCalibrateSamples, hits.Load())
 	}
 }

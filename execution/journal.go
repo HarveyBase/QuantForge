@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/HarveyBase/QuantForge/exchange"
@@ -23,6 +25,9 @@ const DefaultJournalPath = "data/state/orders.jsonl"
 
 // compactKeepTail 压缩时保留的最近事件条数。
 const compactKeepTail = 2000
+
+// journalMaxLine 单行事件读取上限（正常事件远小于此；超长行视为损坏，截断跳过）。
+const journalMaxLine = 1024 * 1024
 
 // JournalEvent 一行事件日志。Ev 取值：
 // register / adopted / update / cancel / remove / freeze_release。
@@ -36,8 +41,9 @@ type JournalEvent struct {
 // 换取压缩重写 rename 之后不残留悬空句柄）；不强制 fsync——崩溃至多丢最后一两条事件，
 // 恢复逻辑可容错（重放语义幂等）。线程安全（mutex）。
 type Journal struct {
-	mu   sync.Mutex
-	path string
+	mu         sync.Mutex
+	path       string
+	writeFails atomic.Int64 // 连续写失败计数（成功清零）；WriteFailures 供上层监控
 }
 
 // NewJournal 挂载事件日志（目录自动创建，文件不存在则创建）。
@@ -76,14 +82,19 @@ func (j *Journal) Append(ev JournalEvent) error {
 	return cerr
 }
 
-// Compact 压缩重写本日志（与 Append 互斥）；语义同包级 Compact。
+// WriteFailures 连续写失败次数（atomic 只读快照，供上层监控接线）。
+func (j *Journal) WriteFailures() int64 { return j.writeFails.Load() }
+
+// Compact 压缩重写本日志（与 Append 互斥）；语义同私有 compact。
 func (j *Journal) Compact(keepNonTerminal bool) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return Compact(j.path, keepNonTerminal)
+	return compact(j.path, keepNonTerminal)
 }
 
-// LoadJournal 读取全量事件；损坏行/空行跳过并计数返回（重放容错：坏行不阻断恢复）。
+// LoadJournal 读取全量事件；损坏行/空行/超长行跳过并计数返回（重放容错：坏行不阻断恢复）。
+// 用 bufio.Reader 按行读而非 Scanner：Scanner 的缓冲上限遇超长损坏行返回 ErrTooLong
+// 会阻断整个恢复；Reader 模式下超长行截断丢弃后继续读后续行。
 func LoadJournal(path string) (events []JournalEvent, skipped int, err error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -93,32 +104,47 @@ func LoadJournal(path string) (events []JournalEvent, skipped int, err error) {
 		return nil, 0, fmt.Errorf("execution: 打开事件日志失败: %w", err)
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
+	r := bufio.NewReaderSize(f, journalMaxLine)
+	for {
+		line, rerr := r.ReadSlice('\n')
+		if rerr == bufio.ErrBufferFull {
+			// 超长行（损坏或异常）：丢弃整行剩余内容，计入 skipped，继续读。
 			skipped++
+			for {
+				if _, e2 := r.ReadSlice('\n'); e2 != bufio.ErrBufferFull {
+					break
+				}
+			}
 			continue
 		}
-		var ev JournalEvent
-		if jerr := json.Unmarshal(line, &ev); jerr != nil {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 {
+			var ev JournalEvent
+			if jerr := json.Unmarshal(trimmed, &ev); jerr != nil {
+				skipped++
+			} else {
+				events = append(events, ev)
+			}
+		} else if rerr == nil { // 空行计 skipped；EOF 处无内容不算
 			skipped++
-			continue
 		}
-		events = append(events, ev)
-	}
-	if serr := sc.Err(); serr != nil {
-		return events, skipped, fmt.Errorf("execution: 读取事件日志失败: %w", serr)
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return events, skipped, fmt.Errorf("execution: 读取事件日志失败: %w", rerr)
+		}
 	}
 	return events, skipped, nil
 }
 
-// Compact 重写事件日志，只保留：全部非终态订单最新快照 + 全部 claimed 幂等键（去重）
+// compact 重写事件日志，只保留：全部非终态订单最新快照 + 全部 claimed 幂等键（去重）
 // + 最近 compactKeepTail 条原始事件（先快照后尾部事件，尾部重放幂等收敛到同一终态）。
 // keepNonTerminal=false 为维护模式：仅截断保留最近 compactKeepTail 条（可能丢失挂单与
 // claimed 信息，正常压缩必须传 true）。原子重写：临时文件 + rename。
-func Compact(path string, keepNonTerminal bool) error {
+// 私有函数：压缩重写必须经 Journal.Compact 持 j.mu 互斥进行，防止与 Append 竞争
+// （包级导出曾是绕过互斥的足枪）。
+func compact(path string, keepNonTerminal bool) error {
 	events, _, err := LoadJournal(path)
 	if err != nil {
 		return err
@@ -233,20 +259,39 @@ func (e *Executor) CompactJournal() error {
 }
 
 // journalEvent 把内存表变更落一条事件（在持有 e.mu 的变更点调用，保证与内存变更同序）。
-// 写失败仅告警不阻断交易：崩溃窗口丢尾部事件可接受，恢复逻辑可容错。
+// 写失败不阻断交易：崩溃窗口丢尾部事件可接受，恢复逻辑可容错。但必须有可观测性：
+// 连续失败计数（成功清零）经 Journal.WriteFailures 供上层监控，失败日志限流
+// （只在第 1、10、100…次打印，防日志风暴淹没正常输出）。
 func (e *Executor) journalEvent(ev string, o exchange.Order) {
 	if e.journal == nil {
 		return
 	}
 	if err := e.journal.Append(JournalEvent{Ts: time.Now(), Ev: ev, Order: o}); err != nil {
-		log.Printf("execution: journal 写入失败(%s %s): %v", ev, o.OrderID, err)
+		n := e.journal.writeFails.Add(1)
+		if failLogMilestone(n) {
+			log.Printf("execution: journal 连续写入失败第 %d 次(%s %s): %v", n, ev, o.OrderID, err)
+		}
+		return
 	}
+	e.journal.writeFails.Store(0)
+}
+
+// failLogMilestone 失败日志限流：n==1 或 10 的幂次（1、10、100…）时打印。
+func failLogMilestone(n int64) bool {
+	if n <= 0 {
+		return false
+	}
+	for n%10 == 0 {
+		n /= 10
+	}
+	return n == 1
 }
 
 // RestoreFromEvents 重放事件日志，重建 orders/byClient/claimed 三张表（inflight 不恢复：
 // 重启后不存在进行中的提交）。重放不回写 journal、不触碰组合账本——资金冻结与持仓
 // 由对账流程重建。重放语义（与内存路径逐点一致，保证写→重放→三张表一致）：
-//   - register/adopted → claimed+byClient+orders 写入；下单即成交的终态单不入 orders，claimed 保留；
+//   - register → claimed+byClient+orders 写入；下单即成交的终态单不入 orders，claimed 保留；
+//   - adopted → claimed+byClient 写入；仅非终态单进 orders（与 recover.go 内存路径一致）；
 //   - update → 按 OrderID 覆盖，FilledQty 单调不减（回退的乱序回报整条忽略）；终态后从 orders 删除但 claimed 保留；
 //   - cancel → 从 orders 删除（cancel 属终态，与内存 Cancel 一致 claimed 保留，幂等防重发跨重启）；
 //   - remove → 删除并解除 claimed（register 冻结失败的回滚路径）。
@@ -256,7 +301,7 @@ func (e *Executor) RestoreFromEvents(events []JournalEvent) {
 	for _, ev := range events {
 		o := ev.Order
 		switch ev.Ev {
-		case "register", "adopted":
+		case "register":
 			if o.OrderID == "" {
 				continue
 			}
@@ -267,6 +312,19 @@ func (e *Executor) RestoreFromEvents(events []JournalEvent) {
 			e.orders[o.OrderID] = o
 			if o.Status.Terminal() && o.FilledQty > 0 {
 				delete(e.orders, o.OrderID) // 下单即成交：内存路径 register 后 applyDelta 随即删除
+			}
+		case "adopted":
+			if o.OrderID == "" {
+				continue
+			}
+			if o.ClientOrderID != "" {
+				e.claimed[o.ClientOrderID] = true
+				e.byClient[o.ClientOrderID] = o.OrderID
+			}
+			// 与 recover.go 内存路径（!Terminal() 才进 orders）对齐：终态单一律不进
+			// 挂单表（无论成交多少），只认领幂等键防重发。
+			if !o.Status.Terminal() {
+				e.orders[o.OrderID] = o
 			}
 		case "update":
 			old, ok := e.orders[o.OrderID]

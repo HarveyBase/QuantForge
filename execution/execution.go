@@ -186,9 +186,13 @@ func (e *Executor) Cancel(ctx context.Context, symbol, orderID string) error {
 		return err
 	}
 	e.mu.Lock()
-	o := e.orders[orderID]
-	delete(e.orders, orderID)
-	e.journalEvent("cancel", o)
+	o, ok := e.orders[orderID]
+	if ok {
+		delete(e.orders, orderID)
+		e.journalEvent("cancel", o)
+	}
+	// 本地未知订单（如 CancelAll 撤交易所侧非本地挂单）：无内存状态可清理，
+	// 跳过 journal 落盘，避免零值事件噪音。
 	e.mu.Unlock()
 	e.releaseFreeze(o)
 	e.emit(Event{Ts: time.Now(), Kind: "cancelled", Order: o})
@@ -251,6 +255,13 @@ func (e *Executor) applyUpdate(fresh exchange.Order) {
 	e.mu.Lock()
 	old, ok := e.orders[fresh.OrderID]
 	if !ok {
+		e.mu.Unlock()
+		return
+	}
+	// FilledQty 单调不减守卫（与 journal 重放侧守卫逐点一致）：交易所读副本最终一致
+	// 返回旧值/乱序回报时整条忽略——不写内存、不落 journal、不 applyDelta。
+	// 乱序终态回报同样忽略：否则会提前 releaseFreeze 且订单从挂单表失联。
+	if fresh.FilledQty < old.FilledQty {
 		e.mu.Unlock()
 		return
 	}
@@ -362,7 +373,7 @@ func duplicateOrderErr(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	for _, kw := range []string{"already exist", "already submitted", "duplicate", "duplicated", "重复"} {
+	for _, kw := range []string{"already exist", "already submitted", "duplicate", "duplicated", "51016", "重复"} {
 		if strings.Contains(msg, kw) {
 			return true
 		}
