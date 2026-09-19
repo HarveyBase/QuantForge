@@ -113,6 +113,7 @@ type app struct {
 	// 运行保障状态（权益看门狗 / 账户对账 / 断流告警）
 	recMu     sync.Mutex                // lastRec 读写锁
 	lastRec   portfolio.ReconcileReport // 最近一次对账报告（dashboard /api/status 展示）
+	recFails  atomic.Int64              // 对账拉取连续失败计数（成功清零；RISK-3 fail-closed 判定）
 	recAlert  alertThrottle             // 对账差异告警节流（10 分钟防刷屏）
 	feedErrs  atomic.Int64              // 行情拉取连续失败计数（恢复清零）
 	feedAlert alertThrottle             // 断流告警节流
@@ -170,13 +171,9 @@ func buildApp(cfg *config.Config) (*app, error) {
 		CooldownAfterRejectSec: cfg.Risk.CooldownAfterRejectSec,
 	}
 	// 启动时先同步现货账户，失败则不进入交易流程。
-	var balances []exchange.Balance
-	if cfg.Mode != config.ModeResearch {
-		var err error
-		if balances, err = ex.GetBalances(context.Background()); err != nil {
-			return nil, fmt.Errorf("账户初始化失败: %w", err)
-		}
-	}
+	// RISK-2：余额拉取必须晚于在途单认领（adopt 在下方交易装配段执行）——
+	// T0 拉挂单 → T1 拉余额 → 清零账本 → Seed：(T0,T1] 窗口内的成交已包含在
+	// T1 余额里，以余额重建账本无成交丢失窗口。
 	rk := risk.NewManager(rkLimits, pf, filepath.Join(cfg.DataDir, "logs", "rejections.jsonl"))
 	g, err := grid.New(grid.Params{
 		Lower: cfg.Strategy.Grid.Lower, Upper: cfg.Strategy.Grid.Upper,
@@ -219,13 +216,19 @@ func buildApp(cfg *config.Config) (*app, error) {
 		log.Printf("state 恢复失败（按全新状态启动）: %v", stErr)
 	}
 	// paper/live 交易装配。启动顺序（红线：先对账再恢复交易）：
-	// journal 恢复订单簿 → 认领交易所在途单 → 以真实 last 价 Seed 账本 →
-	// 日内权益基线跨重启延续 → 强制账户对账（差异则拦截下单，不阻断进程）。
+	// journal 恢复订单簿 → 认领交易所在途单（T0）→ 拉取余额（T1，(T0,T1] 成交无丢失）→
+	// 清零并以真实 last 价 Seed 账本 → 日内权益基线跨重启延续 →
+	// 强制账户对账（差异则拦截下单，不阻断进程）。
 	if cfg.Mode != config.ModeResearch {
 		// 执行器；research 用空执行器（后台展示零订单）
 		a.exec = execution.New(ex, rk, pf, func(ev execution.Event) {
 			if ev.Order.FilledQty > 0 {
-				if g, ok := a.strat.(interface {
+				// BUG-E：回调可能在任意 goroutine 触发，读 a.strat 必须持读锁
+				// （与 SwitchStrategy 的写锁配对），锁内只取局部引用。
+				a.mu.RLock()
+				strat := a.strat
+				a.mu.RUnlock()
+				if g, ok := strat.(interface {
 					ApplyFill(exchange.Side, float64, float64)
 				}); ok {
 					g.ApplyFill(ev.Order.Side, ev.Order.FilledQty, ev.Order.AvgPrice)
@@ -236,7 +239,8 @@ func buildApp(cfg *config.Config) (*app, error) {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
-				a.exec.CancelAll(ctx, cfg.Exchange.InstID)
+				// RISK-7：撤单失败不得静默——与本地挂单数比对，不完整即告警人工兜底
+				a.cancelAllChecked(ctx, "Kill 触发")
 			}()
 		})
 		// Kill 触发链保持现状：撤单 + 告警。cfg.Ops.KillFlatten 本期只读不实现：
@@ -254,11 +258,16 @@ func buildApp(cfg *config.Config) (*app, error) {
 		if cerr := a.exec.CompactJournal(); cerr != nil {
 			log.Printf("execution: journal 启动压缩失败（不影响交易，下次启动重试）: %v", cerr)
 		}
-		// ③ Seed 账本：先清掉认领阶段打到未初始化账本上的成交增量——
-		// 停机期间的成交已包含在交易所余额里，Seed 以余额为唯一权威重建账本
-		// （此时无并发访问，直接重置导出字段安全）。
-		pf.Cash = 0
-		pf.Positions = map[string]*portfolio.Position{}
+		// ③ 余额拉取（T1）：必须在 AdoptOpenOrders（T0）之后——(T0,T1] 窗口内的
+		// 成交已体现在 T1 余额里，随后清零账本以余额为唯一权威重建，无丢失窗口。
+		// 失败则不进入交易流程。
+		balances, berr := ex.GetBalances(context.Background())
+		if berr != nil {
+			return nil, fmt.Errorf("账户初始化失败: %w", berr)
+		}
+		// ④ Seed 账本：先清掉认领阶段打到未初始化账本上的成交增量——
+		// 停机期间的成交已包含在交易所余额里，Seed 以余额为唯一权威重建账本。
+		pf.Reset()
 		mark := fetchMark(ex, cfg.Exchange.InstID)
 		pf.Seed(balances, cfg.Exchange.InstID, strings.Split(cfg.Exchange.InstID, "-")[0], "USDT", mark)
 		if mark > 0 {
@@ -266,7 +275,7 @@ func buildApp(cfg *config.Config) (*app, error) {
 			// ——此前 mark=0 导致 Seed 后权益只有现金，日内回撤基线口径漂移。
 			pf.UpdateMark(cfg.Exchange.InstID, mark)
 		}
-		// ④ 日内权益基线跨重启：同日延续旧基线（当日亏损不因重启遗忘），跨日重置。
+		// ⑤ 日内权益基线跨重启：同日延续旧基线（当日亏损不因重启遗忘），跨日重置。
 		today := time.Now().UTC().Format("2006-01-02")
 		if stErr == nil && st.Day == today && st.DayStartEq > 0 {
 			rk.SetDayStartEquity(st.DayStartEq)
@@ -274,7 +283,7 @@ func buildApp(cfg *config.Config) (*app, error) {
 		} else {
 			rk.SetDayStartEquity(pf.Equity())
 		}
-		// ⑤ 强制账户对账：不阻断进程（dashboard 可看、人工介入），差异时下单被
+		// ⑥ 强制账户对账：不阻断进程（dashboard 可看、人工介入），差异时下单被
 		// RECONCILE_BLOCK 拦截。
 		a.reconcileOnce(context.Background())
 	}
@@ -308,6 +317,9 @@ func buildApp(cfg *config.Config) (*app, error) {
 		if st.KillTripped {
 			rk.Kill.Restore(true, st.KillReason)
 			log.Printf("Kill Switch 处于触发状态（%s），继续停机", st.KillReason)
+			// RISK-4：Kill 态跨重启恢复补撤单——上次停机 OnTrip 链的撤单可能没执行
+			// 完（进程被杀），Kill 语义是"无挂单在场"。research（无执行器）跳过。
+			a.killRestoreCancel(st.KillReason)
 		}
 		a.restoreStrategyState(st.StrategyState)
 		a.activeMode.Store(string(cfg.Mode)) // 活跃环境初始 = 启动配置（页面可降级；升级受门禁）
@@ -397,6 +409,8 @@ func (t *alertThrottle) allow() bool {
 }
 
 // reconcileDustUSDT 对账粉尘豁免：绝对差异 ≤0.5 USDT 等值忽略（防小额残渣误报刷告警）。
+// 仅限 cash 类差异（计价币，天然 USDT 等值）；position/available 类按币数量计，
+// 0.4 BTC ≈ 数万美元不得当粉尘放行——其浮点残差由内禀 0.1% 相对容差覆盖。
 const reconcileDustUSDT = 0.5
 
 // reconcileWithinTolerance 对账"判定 Ok"层：ReconcileDetail 内禀容差 0.1% 之外，
@@ -410,8 +424,8 @@ func reconcileWithinTolerance(rep portfolio.ReconcileReport, tolerancePct float6
 		tolerancePct = 0.5
 	}
 	for _, d := range rep.Diffs {
-		if math.Abs(d.Diff) <= reconcileDustUSDT {
-			continue // 粉尘豁免
+		if d.Kind == portfolio.DiffCash && math.Abs(d.Diff) <= reconcileDustUSDT {
+			continue // 粉尘豁免（仅计价币）
 		}
 		ref := math.Max(math.Abs(d.Local), math.Abs(d.Remote))
 		if ref <= 0 {
@@ -442,17 +456,29 @@ func reconcileDiffSummary(diffs []portfolio.ReconcileDiff) string {
 
 // reconcileOnce 强制账户对账一次：拉取交易所余额 → ReconcileDetail 结构化比对 →
 // 配置容差内一致 → ClearReconcileBlock；超容差 → BlockForReconcile（新下单被
-// RECONCILE_BLOCK 拦截）+ 严重告警（10 分钟节流）。拉取失败不改拦截状态
-// （无法验证时保持现状，保守侧）并返回错误。
+// RECONCILE_BLOCK 拦截）+ 严重告警（10 分钟节流）。
+// 拉取失败 fail-closed（RISK-3）：从未成功对账过（lastRec 零值）→ 直接拦截——
+// 开始交易前必须先见过一次账本；成功过一次后短暂失败保持现状（宽容），连续失败
+// ≥3 次再拦截。返回错误供 dashboard Kill 复位门禁使用。
 func (a *app) reconcileOnce(ctx context.Context) (rep portfolio.ReconcileReport, ok bool, err error) {
 	bctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	balances, berr := a.ex.GetBalances(bctx)
 	cancel()
 	if berr != nil {
 		berr = fmt.Errorf("拉取余额失败: %w", berr)
-		log.Printf("账户对账失败（%v，保持现有拦截状态）", berr)
+		fails := a.recFails.Add(1)
+		if last := a.lastReconcileReport(); last.Ts.IsZero() {
+			a.rk.BlockForReconcile("对账从未成功（" + berr.Error() + "）")
+			log.Printf("账户对账从未成功，新下单被拦截（fail-closed，对账成功后自动解除）: %v", berr)
+		} else if fails >= 3 {
+			a.rk.BlockForReconcile(fmt.Sprintf("对账连续失败 %d 次（%v）", fails, berr))
+			log.Printf("账户对账连续失败 %d 次，新下单被拦截: %v", fails, berr)
+		} else {
+			log.Printf("账户对账失败（连续 %d 次，保持现有拦截状态）: %v", fails, berr)
+		}
 		return a.lastReconcileReport(), false, berr
 	}
+	a.recFails.Store(0)
 	rep = a.pf.ReconcileDetail(balances)
 	ok = reconcileWithinTolerance(rep, a.cfg.Ops.ReconcileTolerancePct)
 	a.recMu.Lock()
@@ -561,38 +587,72 @@ func (a *app) onWSError(err error) {
 	}
 }
 
+// cancelAllChecked 撤单 + 完整性核对（RISK-7）：撤单前记本地挂单数 n，CancelAll
+// 返回实撤数 c，c < n 告警（CancelAll 内部拉取挂单失败同样表现为 c=0，n>0 时必告警，
+// 不碰 execution 包即可在 main 层完成核对）。返回实撤数。
+func (a *app) cancelAllChecked(ctx context.Context, scene string) int {
+	n := len(a.exec.OpenOrders())
+	c := a.exec.CancelAll(ctx, a.cfg.Exchange.InstID)
+	if c < n {
+		a.notifier.Send(fmt.Sprintf("🔴 %s撤单可能不完整：期望 %d 实撤 %d（请人工核对交易所挂单）", scene, n, c))
+	}
+	return c
+}
+
+// killRestoreCancel Kill 态跨重启恢复补撤单（RISK-4）：进程被杀时 OnTrip 链的撤单
+// 可能没执行完，Kill 语义是"无挂单在场"——恢复即补撤一次并告警留痕；CancelAll
+// 返回值无法区分"没单可撤"与"拉取失败"，一律推送人工兜底提示。撤单与本地挂单数
+// 比对，不完整追加告警（RISK-7 同口径）。
+func (a *app) killRestoreCancel(reason string) {
+	if a.exec == nil { // research 未装配执行器：无交易无挂单，跳过
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	n := len(a.exec.OpenOrders())
+	c := a.exec.CancelAll(ctx, a.cfg.Exchange.InstID)
+	log.Printf("Kill 态跨重启恢复：已补撤挂单 %d/%d 张", c, n)
+	a.notifier.Send(fmt.Sprintf("🔴 Kill 态跨重启恢复，已补撤挂单 %d 张；若撤单失败请人工处理（原因：%s）", c, reason))
+	if c < n {
+		a.notifier.Send(fmt.Sprintf("🔴 Kill 态恢复撤单可能不完整：期望 %d 实撤 %d（请人工核对交易所挂单）", n, c))
+	}
+}
+
 // gracefulShutdown 优雅退出编排（P1-2，总预算 30s 超时保护）：
-//  1. 停策略驱动——外层 ctx 已取消，Poller/WS/看门狗/对账循环/复盘循环自行退出，
+//  1. httpSrv.Shutdown（3s，httpSrv 可为 nil）最先执行：拒绝新请求——drain 期间
+//     手动下单/切环境/复位 Kill 等写入口不再开放（RISK-6；Shutdown 会等 in-flight
+//     handler 返回，新请求进不来）；
+//  2. 停策略驱动——外层 ctx 已取消，Poller/WS/看门狗/对账循环/复盘循环自行退出，
 //     不再产生新信号/新下单；
-//  2. 可选撤单：ops.shutdown_cancel_orders=true（默认）且 paper/live → CancelAll
-//     （10s 子预算）。false 的语义是"挂单留守在场，重启后由 AdoptOpenOrders 认领"
-//     （live 留守值守场景的人工选择）；
-//  3. persistState：游标/试验数/Kill/UMP/日内基线最新态落盘；
-//  4. exec.Stop()：停执行器订单回报同步循环；
-//  5. httpSrv.Shutdown（3s，httpSrv 可为 nil）。
+//  3. 可选撤单：ops.shutdown_cancel_orders=true（默认）且 paper/live → CancelAll
+//     （10s 子预算）+ 完整性核对告警。false 的语义是"挂单留守在场，重启后由
+//     AdoptOpenOrders 认领"（live 留守值守场景的人工选择）；
+//  4. persistState：游标/试验数/Kill/UMP/日内基线最新态落盘；
+//  5. exec.Stop()：停执行器订单回报同步循环。
 //
 // 退出码 0：drain 尽力完成，预算耗尽也正常返回（留痕）。
 func (a *app) gracefulShutdown(httpSrv *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	log.Printf("收到退出信号，开始优雅退出（预算 30s）")
+	if httpSrv != nil {
+		hctx, hcancel := context.WithTimeout(ctx, 3*time.Second)
+		_ = httpSrv.Shutdown(hctx)
+		hcancel()
+	}
 	if a.cfg.Ops.ShutdownCancelOrders && a.exec != nil {
 		cctx, ccancel := context.WithTimeout(ctx, 10*time.Second)
-		if n := a.exec.CancelAll(cctx, a.cfg.Exchange.InstID); n > 0 {
-			log.Printf("优雅退出：已撤挂单 %d 张", n)
-		}
+		c := a.cancelAllChecked(cctx, "优雅退出")
 		ccancel()
+		if c > 0 {
+			log.Printf("优雅退出：已撤挂单 %d 张", c)
+		}
 	} else if a.exec != nil {
 		log.Printf("优雅退出：shutdown_cancel_orders=false，挂单留守（重启后由 AdoptOpenOrders 认领）")
 	}
 	a.persistState()
 	if a.exec != nil {
 		a.exec.Stop()
-	}
-	if httpSrv != nil {
-		hctx, hcancel := context.WithTimeout(ctx, 3*time.Second)
-		_ = httpSrv.Shutdown(hctx)
-		hcancel()
 	}
 	log.Printf("优雅退出完成")
 }
@@ -622,7 +682,11 @@ func (a *app) onCandles(candles []exchange.Candle) {
 	}
 	// regime 自动路由（默认关，config 显式开启才生效——证据纪律 docs/10 §6）
 	if a.cfg.Strategy.Both.RegimeRoute {
-		if cp, ok := a.strat.(*strategy.Composite); ok {
+		// BUG-E：读 a.strat 持读锁取局部引用（锁范围尽量小）
+		a.mu.RLock()
+		cp, isComposite := a.strat.(*strategy.Composite)
+		a.mu.RUnlock()
+		if isComposite {
 			cp.SetActive("grid", rd.Kind != regime.Trending)
 			cp.SetActive("trend", rd.Kind != regime.Range)
 		}
@@ -655,7 +719,11 @@ func (a *app) onCandles(candles []exchange.Candle) {
 		Symbol: a.cfg.Exchange.InstID, Interval: a.cfg.Trading.Interval,
 		Candles: candles, Equity: a.pf.Equity(), Position: posQty, Cash: cash,
 	}
-	for intentIndex, intent := range a.strat.OnCandle(sctx) {
+	// BUG-E：读 a.strat 持读锁取局部引用后使用（驱动用局部变量，不得在锁内跑策略）
+	a.mu.RLock()
+	strat := a.strat
+	a.mu.RUnlock()
+	for intentIndex, intent := range strat.OnCandle(sctx) {
 		// UMP 拦截：只拦买入（离场信号自由）；卖出是风险释放不该被拦
 		if a.umpOn && a.umpFilter != nil && intent.Side == exchange.Buy {
 			if fe, err := ump.Extract(candles, len(candles)-1); err == nil {
@@ -758,7 +826,11 @@ func (a *app) collectReviewInput(from time.Time) review.Input {
 		in.CandlesSeen++
 	}
 	a.mu.RUnlock()
-	switch st := a.strat.(type) {
+	// BUG-E：读 a.strat 持读锁取局部引用
+	a.mu.RLock()
+	strat := a.strat
+	a.mu.RUnlock()
+	switch st := strat.(type) {
 	case *grid.Grid:
 		gs := st.Stats()
 		in.Strategy = fmt.Sprintf("grid: rounds=%d realized=%.2f broke=%v position=%.4f | 市况 %s",
@@ -766,7 +838,7 @@ func (a *app) collectReviewInput(from time.Time) review.Input {
 	case *trend.Donchian:
 		in.Strategy = fmt.Sprintf("trend: %s | 市况 %s", st.Describe(), a.regimeDet.Current())
 	default:
-		in.Strategy = fmt.Sprintf("%s | 市况 %s", a.strat.Name(), a.regimeDet.Current())
+		in.Strategy = fmt.Sprintf("%s | 市况 %s", strat.Name(), a.regimeDet.Current())
 	}
 	return in
 }
@@ -923,7 +995,7 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 				return s
 			}, fmt.Sprintf("trend:%dx%d", a.cfg.Strategy.Trend.EntryN, a.cfg.Strategy.Trend.ExitN))
 		case "grid":
-			selector = lab.FixedSelector(func() strategy.Strategy { return a.grid }, "grid:config")
+			selector = lab.FixedSelector(func() strategy.Strategy { return a.currentGrid() }, "grid:config")
 		default:
 			return nil, fmt.Errorf("未知策略 %q（支持 trend / grid）", strategyName)
 		}
@@ -956,7 +1028,7 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 				return s
 			}
 		case "grid":
-			mk = func() strategy.Strategy { return a.grid }
+			mk = func() strategy.Strategy { return a.currentGrid() }
 		default:
 			return 0, nil, fmt.Errorf("未知策略 %q", strategyName)
 		}
@@ -967,7 +1039,7 @@ func cmdServe(fs *flag.FlagSet, args []string) error {
 	if a.exec != nil {
 		orderSrc = a.exec
 	}
-	srv := dashboard.New(cfg, a.pf, a.rk, orderSrc, a.grid, func() []exchange.Candle {
+	srv := dashboard.New(cfg, a.pf, a.rk, orderSrc, a.currentGrid, func() []exchange.Candle {
 		a.mu.RLock()
 		defer a.mu.RUnlock()
 		return append([]exchange.Candle(nil), a.candles...)
@@ -1070,16 +1142,20 @@ func (a *app) restoreStrategyState(raw json.RawMessage) {
 	if len(raw) == 0 {
 		return // 首次启动 / 老版本 state 文件：无快照，正常冷启动（不留痕防刷屏）
 	}
-	s, ok := a.strat.(strategy.Stateful)
+	// BUG-E：读 a.strat 持读锁取局部引用（exec 回调可能与恢复并发）
+	a.mu.RLock()
+	strat := a.strat
+	a.mu.RUnlock()
+	s, ok := strat.(strategy.Stateful)
 	if !ok {
-		log.Printf("策略不支持状态恢复，将冷启动（%s）", a.strat.Name())
+		log.Printf("策略不支持状态恢复，将冷启动（%s）", strat.Name())
 		return
 	}
 	if err := s.ImportState(raw); err != nil {
 		log.Printf("策略运行态恢复失败，已冷启动（状态与当前配置可能不一致，人工核对）: %v", err)
 		return
 	}
-	log.Printf("策略运行态已恢复（%s）", a.strat.Name())
+	log.Printf("策略运行态已恢复（%s）", strat.Name())
 }
 
 // persistState 运行态落盘（游标/试验数/Kill/UMP/日内权益基线/策略运行态）；
@@ -1149,11 +1225,14 @@ func (a *app) SwitchMode(target config.Mode, confirm string) error {
 }
 
 // SwitchStrategy 页面热切策略：仅无持仓时允许（持仓中换策略=退出规则悬空，禁止）。
+// grid/both 分支一律新建 grid 实例（RISK-9）：切换即冷启动——复用旧实例会让旧
+// lastIdx 复活引发追赶单；a.grid 同步替换，dashboard（GridFn）/研究入口自动跟随。
 func (a *app) SwitchStrategy(name string) error {
 	var s strategy.Strategy
+	var g *grid.Grid
 	switch name {
 	case "grid":
-		g, err := grid.New(grid.Params{
+		ng, err := grid.New(grid.Params{
 			Lower: a.cfg.Strategy.Grid.Lower, Upper: a.cfg.Strategy.Grid.Upper,
 			Grids: a.cfg.Strategy.Grid.Grids, QtyPerGrid: a.cfg.Strategy.Grid.QtyPerGrid,
 			Spacing: a.cfg.Strategy.Grid.Spacing, StopOnBreak: a.cfg.Strategy.Grid.StopOnBreak,
@@ -1161,7 +1240,7 @@ func (a *app) SwitchStrategy(name string) error {
 		if err != nil {
 			return err
 		}
-		s = g
+		s, g = ng, ng
 	case "trend":
 		tr, err := trend.New(trend.Params{
 			EntryN: a.cfg.Strategy.Trend.EntryN, ExitN: a.cfg.Strategy.Trend.ExitN,
@@ -1181,8 +1260,18 @@ func (a *app) SwitchStrategy(name string) error {
 		if err != nil {
 			return err
 		}
-		s = strategy.NewComposite([]string{"grid", "trend"}, []strategy.Strategy{a.grid, tr},
+		ng, err := grid.New(grid.Params{
+			Lower: a.cfg.Strategy.Grid.Lower, Upper: a.cfg.Strategy.Grid.Upper,
+			Grids: a.cfg.Strategy.Grid.Grids, QtyPerGrid: a.cfg.Strategy.Grid.QtyPerGrid,
+			Spacing: a.cfg.Strategy.Grid.Spacing, StopOnBreak: a.cfg.Strategy.Grid.StopOnBreak,
+		})
+		if err != nil {
+			return err
+		}
+		// 组合：grid+trend 按权重分资金（regime 路由默认关——证据纪律）
+		s = strategy.NewComposite([]string{"grid", "trend"}, []strategy.Strategy{ng, tr},
 			[]float64{a.cfg.Strategy.Both.GridWeight, a.cfg.Strategy.Both.TrendWeight})
+		g = ng
 	default:
 		return fmt.Errorf("未知策略 %q（支持 grid / trend / both）", name)
 	}
@@ -1192,19 +1281,34 @@ func (a *app) SwitchStrategy(name string) error {
 			return fmt.Errorf("持仓中禁止切换策略（%s 数量 %v，先平仓再切）", p.Symbol, p.Qty)
 		}
 	}
-	// 写锁与 persistState 的读锁配对（运行态导出读取 a.strat 时不得并发换策略）
+	// 写锁与 persistState/各读点配对；grid 实例一并替换（dashboard GridFn 取当前实例）
 	a.mu.Lock()
 	a.strat = s
+	if g != nil {
+		a.grid = g
+	}
 	a.mu.Unlock()
 	return nil
 }
 
 // CurrentStrategy 当前策略名与描述。
 func (a *app) CurrentStrategy() string {
-	if d, ok := a.strat.(interface{ Describe() string }); ok {
+	// BUG-E：读 a.strat 持读锁取局部引用（与 SwitchStrategy 写锁配对）
+	a.mu.RLock()
+	strat := a.strat
+	a.mu.RUnlock()
+	if d, ok := strat.(interface{ Describe() string }); ok {
 		return d.Describe()
 	}
-	return a.strat.Name()
+	return strat.Name()
+}
+
+// currentGrid 当前 grid 实例快照（RISK-9：策略热切换会替换 grid 实例，
+// dashboard/研究入口统一经此取"当前"实例，读侧必须持锁）。
+func (a *app) currentGrid() *grid.Grid {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.grid
 }
 
 // RunPlateau 参数邻域高原检验（研究工作台）。窗口=最近 3000 根。
@@ -1238,7 +1342,7 @@ func (a *app) RunPlateau(ctx context.Context, strategyName string) (*lab.Plateau
 			}
 			g, err := grid.New(p)
 			if err != nil {
-				return a.grid
+				return a.currentGrid()
 			}
 			return g
 		default: // trend：EntryN 邻域 ±2（其余默认）
@@ -1281,7 +1385,7 @@ func (a *app) RunCostScan(ctx context.Context, strategyName string) ([]lab.CostP
 	var mk func() strategy.Strategy
 	switch strategyName {
 	case "grid":
-		mk = func() strategy.Strategy { return a.grid }
+		mk = func() strategy.Strategy { return a.currentGrid() }
 	default:
 		mk = func() strategy.Strategy {
 			s, _ := trend.New(trend.Params{

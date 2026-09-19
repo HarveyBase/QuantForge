@@ -31,6 +31,54 @@ func TestSeedFromBalances(t *testing.T) {
 	}
 }
 
+// TestSeedQtyTracksTotal RISK-1 回归：账本 Qty 记总持仓（= Total）、Available 记
+// 交易所可用——认领挂卖单（交易所冻结 0.1）后重启，Qty=C−q vs 远程 Total=C 会产生
+// 永久对账差异；冻结语义由 freezes 承担。
+func TestSeedQtyTracksTotal(t *testing.T) {
+	p := New(0)
+	p.Seed([]exchange.Balance{
+		{Asset: "USDT", Total: 1000, Available: 1000},
+		{Asset: "BTC", Total: 1, Available: 0.9},
+	}, "BTC-USDT", "BTC", "USDT", 100)
+	pos := p.Positions["BTC-USDT"]
+	if pos == nil || pos.Qty != 1 || pos.Available != 0.9 {
+		t.Fatalf("Seed 应记 Qty=Total=1、Available=0.9（冻结语义由 freezes 承担）: %+v", pos)
+	}
+	// 语义自洽：Qty 对 Total、Available 对 Available → 重启带挂卖单场景对账一致
+	rep := p.ReconcileDetail([]exchange.Balance{
+		{Asset: "USDT", Total: 1000, Available: 1000},
+		{Asset: "BTC", Total: 1, Available: 0.9},
+	})
+	if !rep.Ok {
+		t.Fatalf("Total/Available 双口径各自对齐远程字段，应判定一致: %+v", rep)
+	}
+	// 可卖校验口径不变：Available 仍限制卖出冻结（0.9 可冻）
+	if !p.Freeze(exchange.OrderRequest{Symbol: "BTC-USDT", Side: exchange.Sell, Price: 100, Qty: 0.9, ClientOrderID: "rs-sell"}) {
+		t.Fatal("按 Available=0.9 冻结卖出应成功")
+	}
+	if p.Freeze(exchange.OrderRequest{Symbol: "BTC-USDT", Side: exchange.Sell, Price: 100, Qty: 0.1, ClientOrderID: "rs-sell2"}) {
+		t.Fatal("超 Available 冻结必须失败（可卖校验用 Available）")
+	}
+}
+
+// TestResetClearsLedger 账本清零（现金/持仓/标记价/冻结四清）——启动 Seed 前的
+// 权威重建入口。
+func TestResetClearsLedger(t *testing.T) {
+	p := New(1000)
+	p.ApplyTrade(filled("BTC-USDT", exchange.Buy, 1, 100, 0))
+	p.Freeze(exchange.OrderRequest{Symbol: "BTC-USDT", Side: exchange.Sell, Price: 110, Qty: 1, ClientOrderID: "rz-1"})
+	p.UpdateMark("BTC", 120)
+	p.Reset()
+	if p.Cash != 0 || len(p.Positions) != 0 || p.Mark("BTC") != 0 {
+		t.Fatalf("Reset 应清零现金/持仓/标记价: cash=%v pos=%v mark=%v", p.Cash, p.Positions, p.Mark("BTC"))
+	}
+	// 冻结也一并清空：同键可重新冻结且现金不被旧冻结占用
+	p.Cash = 100
+	if !p.Freeze(exchange.OrderRequest{Symbol: "BTC-USDT", Side: exchange.Buy, Price: 10, Qty: 1, ClientOrderID: "rz-1"}) {
+		t.Fatal("Reset 后旧冻结键应可重新冻结")
+	}
+}
+
 func TestFreezeBuyInsufficientCash(t *testing.T) {
 	p := New(100)
 	if p.Freeze(exchange.OrderRequest{Symbol: "BTC-USDT", Side: exchange.Buy, Price: 50, Qty: 3, ClientOrderID: "f1"}) {

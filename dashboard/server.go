@@ -31,11 +31,11 @@ import (
 
 // Server 后台服务。
 type Server struct {
-	Cfg             *config.Config
-	Pf              *portfolio.Portfolio
-	Rk              *risk.Manager
-	Ex              OrderSource
-	Grid            *grid.Grid
+	Cfg    *config.Config
+	Pf     *portfolio.Portfolio
+	Rk     *risk.Manager
+	Ex     OrderSource
+	GridFn func() *grid.Grid // 当前 grid 实例（RISK-9：策略热切换会替换实例，注入函数每次取当前；nil = 未装配/无实例）
 	Snapshots       func() []exchange.Candle                           // 最近已确认 K 线
 	Candles         func(interval string, limit int) []exchange.Candle // SQLite 库读取（任意周期/全历史）
 	OrderBook       func() *exchange.OrderBook                         // 盘口深度（spread/流动性）
@@ -70,12 +70,12 @@ type Server struct {
 	version string
 }
 
-// New 构造后台服务。
+// New 构造后台服务。gridFn 每次调用返回当前 grid 实例（策略热切换后自动跟随）。
 func New(cfg *config.Config, pf *portfolio.Portfolio, rk *risk.Manager,
-	ex OrderSource, g *grid.Grid,
+	ex OrderSource, gridFn func() *grid.Grid,
 	snapshots func() []exchange.Candle, runBt func(ctx context.Context) (*backtest.Result, error)) *Server {
 	return &Server{
-		Cfg: cfg, Pf: pf, Rk: rk, Ex: ex, Grid: g,
+		Cfg: cfg, Pf: pf, Rk: rk, Ex: ex, GridFn: gridFn,
 		Snapshots: snapshots, RunBacktest: runBt,
 		subs: map[chan []byte]struct{}{}, started: time.Now(), version: "0.1.0",
 	}
@@ -174,8 +174,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	cash, positions, _ := s.Pf.Snapshot()
-	_, _, marks := s.Pf.Snapshot()
+	cash, positions, marks := s.Pf.Snapshot()
 	writeJSON(w, map[string]any{
 		"version":             s.version,
 		"mode":                s.Cfg.Mode,
@@ -308,9 +307,11 @@ func (s *Server) handleOrderBook(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGrid(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{}
-	if s.Grid != nil {
-		resp["levels"] = s.Grid.Levels()
-		resp["stats"] = s.Grid.Stats()
+	if s.GridFn != nil {
+		if g := s.GridFn(); g != nil {
+			resp["levels"] = g.Levels()
+			resp["stats"] = g.Stats()
+		}
 	}
 	writeJSON(w, resp)
 }

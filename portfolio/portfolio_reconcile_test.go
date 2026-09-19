@@ -121,6 +121,35 @@ func TestReconcileDetailToleranceBoundary(t *testing.T) {
 	}
 }
 
+// TestReconcileCashCountsBuyFreeze BUG-C 回归：本地 Cash 是已扣买单冻结的"可用"
+// 口径，比对交易所 Total 必须加回在途买单冻结——10000 现金挂 100 USDT 买单 +
+// 交易所 Total=10000/Avail=9900 的常态场景必须 Ok=true（修复前误报 diff 100 →
+// 超容差 → RECONCILE_BLOCK 误拦网格常态）。
+func TestReconcileCashCountsBuyFreeze(t *testing.T) {
+	p := New(10000)
+	req := exchange.OrderRequest{Symbol: "BTC-USDT", Side: exchange.Buy, Price: 100, Qty: 1, ClientOrderID: "rc-buy"}
+	if !p.Freeze(req) {
+		t.Fatal("冻结失败")
+	}
+	if p.Cash != 9900 {
+		t.Fatalf("冻结后本地可用现金应为 9900: %v", p.Cash)
+	}
+	rep := p.ReconcileDetail([]exchange.Balance{{Asset: "USDT", Total: 10000, Available: 9900}})
+	if !rep.Ok {
+		t.Fatalf("本地可用 + 在途买单冻结 ≈ 交易所 Total，挂单常态不得误报差异: %+v", rep)
+	}
+	// 部分成交后退冻结按成交价重扣：Cash + 剩余冻结仍 ≈ Total（0.4 成交花 40 →
+	// 交易所 Total 9960、本地 9900 + 60 冻结）
+	p.ApplyFill(exchange.Fill{Symbol: "BTC-USDT", ClientOrderID: "rc-buy", Side: exchange.Buy, Qty: 0.4, Price: 100, Fee: 0})
+	rep2 := p.ReconcileDetail([]exchange.Balance{
+		{Asset: "USDT", Total: 9960, Available: 9900},
+		{Asset: "BTC", Total: 0.4, Available: 0.4},
+	})
+	if !rep2.Ok {
+		t.Fatalf("部分成交后口径仍应一致: %+v", rep2)
+	}
+}
+
 // Seed 登记的币种参与对账映射（quote 计价现金、base 持仓）。
 func TestReconcileDetailUsesSeededCurrencies(t *testing.T) {
 	p := New(0)

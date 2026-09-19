@@ -20,6 +20,8 @@ import (
 	"github.com/HarveyBase/QuantForge/dashboard"
 	"github.com/HarveyBase/QuantForge/exchange"
 	"github.com/HarveyBase/QuantForge/exchange/okx"
+	"github.com/HarveyBase/QuantForge/portfolio"
+	"github.com/HarveyBase/QuantForge/strategy"
 	"github.com/HarveyBase/QuantForge/ump"
 )
 
@@ -321,6 +323,136 @@ func genCandles(n int) []exchange.Candle {
 // 编译期确认 backtest.Result 仍在使用（保持导入）。
 var _ = (*backtest.Result)(nil)
 var _ = time.Second
+
+// TestReconcileDustExemptionCashOnly BUG-D 回归：粉尘豁免仅限 cash（计价币，USDT
+// 等值）差异；position/available 按币数量计，本地 0 BTC vs 交易所 0.4 BTC
+// （|Diff|=0.4 ≤ 0.5 粉尘线，数万美元）不得被当粉尘放行。
+func TestReconcileDustExemptionCashOnly(t *testing.T) {
+	// 0.4 BTC 持仓差异：绝对值落在旧粉尘线内，必须仍判不通过
+	posDiff := portfolio.ReconcileReport{Diffs: []portfolio.ReconcileDiff{
+		{Kind: portfolio.DiffPosition, Item: "BTC-USDT", Local: 0, Remote: 0.4, Diff: 0.4},
+	}}
+	if reconcileWithinTolerance(posDiff, 0.5) {
+		t.Fatal("0.4 BTC 持仓差异（数万美元）不得按粉尘放行")
+	}
+	// available 类差异同样不豁免
+	availDiff := portfolio.ReconcileReport{Diffs: []portfolio.ReconcileDiff{
+		{Kind: portfolio.DiffAvailable, Item: "BTC-USDT", Local: 1, Remote: 1.3, Diff: 0.3},
+	}}
+	if reconcileWithinTolerance(availDiff, 0.5) {
+		t.Fatal("available 类差异不得按粉尘放行（浮点残差由相对容差覆盖）")
+	}
+	// 0.3 USDT 现金差异：可豁免
+	cashDiff := portfolio.ReconcileReport{Diffs: []portfolio.ReconcileDiff{
+		{Kind: portfolio.DiffCash, Item: "USDT", Local: 10000, Remote: 10000.3, Diff: 0.3},
+	}}
+	if !reconcileWithinTolerance(cashDiff, 0.5) {
+		t.Fatal("0.3 USDT 计价币差异应按粉尘豁免")
+	}
+}
+
+// TestStrategyAccessConcurrentSafe BUG-E 回归：热切换写 a.strat/a.grid 与各读点
+// （CurrentStrategy / collectReviewInput / currentGrid）并发，-race 下无数据竞争。
+func TestStrategyAccessConcurrentSafe(t *testing.T) {
+	cfg := mockOKX(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	readers := []func(){
+		func() { _ = a.CurrentStrategy() },
+		func() { _ = a.collectReviewInput(time.Now().Add(-time.Hour)) },
+		func() { _ = a.currentGrid() },
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					readers[i%len(readers)]()
+				}
+			}
+		}(i)
+	}
+	for i := 0; i < 30; i++ {
+		target := "trend"
+		if i%2 == 0 {
+			target = "grid"
+		}
+		if err := a.SwitchStrategy(target); err != nil {
+			t.Fatalf("热切失败: %v", err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// TestSwitchStrategyGridColdStart RISK-9 回归：grid/both 热切换必须新建 grid 实例
+// （旧 lastIdx 复活会引发追赶单）；a.grid 同步替换，组合策略驱动的也是新实例。
+func TestSwitchStrategyGridColdStart(t *testing.T) {
+	cfg := mockOKX(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot := a.currentGrid()
+	// grid 分支：新实例且冷启动（started=false）
+	if err := a.SwitchStrategy("grid"); err != nil {
+		t.Fatal(err)
+	}
+	g1 := a.currentGrid()
+	if g1 == boot {
+		t.Fatal("grid 热切换必须是新实例（切换即冷启动）")
+	}
+	if startedOf(t, g1) {
+		t.Fatal("切换后的新实例必须是冷启动（started=false）")
+	}
+	// both 分支：同样新实例，不复用 boot/g1
+	if err := a.SwitchStrategy("both"); err != nil {
+		t.Fatal(err)
+	}
+	g2 := a.currentGrid()
+	if g2 == boot || g2 == g1 {
+		t.Fatal("both 分支必须新建 grid 实例，不得复用旧实例（旧 lastIdx 复活引发追赶单）")
+	}
+	// 组合策略驱动的是新实例：驱动一根后 g2 started、g1 保持冷
+	a.mu.RLock()
+	strat := a.strat
+	a.mu.RUnlock()
+	sctx := &strategy.Context{
+		Symbol: "BTC-USDT", Interval: "1H", Candles: genCandles(50),
+		Equity: 10000, Position: 0, Cash: 10000,
+	}
+	_ = strat.OnCandle(sctx)
+	if !startedOf(t, g2) {
+		t.Fatal("组合策略必须驱动新建的 grid 实例（dashboard/研究入口经 currentGrid 跟随）")
+	}
+	if startedOf(t, g1) {
+		t.Fatal("切换即冷启动：被换下的旧实例不得再被驱动")
+	}
+}
+
+// startedOf 读 grid 运行态的 started 标记（冷启动断言用）。
+func startedOf(t *testing.T, g interface{ ExportState() (json.RawMessage, error) }) bool {
+	t.Helper()
+	raw, err := g.ExportState()
+	if err != nil {
+		t.Fatalf("grid 状态导出失败: %v", err)
+	}
+	var st struct {
+		Started bool `json:"started"`
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatalf("grid 状态解析失败: %v", err)
+	}
+	return st.Started
+}
 
 func TestBuildAppPaperNoCredsFails(t *testing.T) {
 	os.Unsetenv("OKX_API_KEY")
@@ -724,7 +856,7 @@ func TestLiveBootModeMatrix(t *testing.T) {
 		t.Fatal("live 启动初始活跃环境应为 live")
 	}
 	// 真实 dashboard 链路（与 cmdServe 同一装配路径）
-	srv := dashboard.New(cfg, a.pf, a.rk, a.exec, a.grid, nil, nil)
+	srv := dashboard.New(cfg, a.pf, a.rk, a.exec, a.currentGrid, nil, nil)
 	srv.ActiveMode = a.ActiveMode
 	srv.BootMode = cfg.Mode
 	srv.SwitchMode = a.SwitchMode

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,6 +36,11 @@ type lifeMock struct {
 	cancels    int
 	placed     int
 	autoHold   bool // 下单自动进 pending（模拟真实挂单簿）
+	// 测试编排辅助
+	hits            []string // 端点命中顺序（RISK-2 启动顺序断言用）
+	balanceCalls    int      // balance 端点调用计数
+	balanceFailFrom int      // >0 且调用序号 ≥ 该值时 balance 返回错误（0=不失败）
+	cancelFail      bool     // cancel-order 返回错误（测撤单完整性告警）
 }
 
 func newLifeMock() *lifeMock {
@@ -77,6 +83,32 @@ func (m *lifeMock) placeCount() int {
 	return m.placed
 }
 
+// setBalanceFailFrom 第 n 次及之后的 balance 调用返回错误（0=恢复成功）。
+func (m *lifeMock) setBalanceFailFrom(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.balanceFailFrom = n
+}
+
+// setCancelFail 控制 cancel-order 是否返回错误。
+func (m *lifeMock) setCancelFail(b bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cancelFail = b
+}
+
+// firstHit 端点首次命中的序号（-1 = 未命中）。
+func (m *lifeMock) firstHit(ep string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, h := range m.hits {
+		if h == ep {
+			return i
+		}
+	}
+	return -1
+}
+
 // newLifeServer 启动 mock OKX 服务并返回绑定它的 paper 配置。
 func newLifeServer(t *testing.T) (*lifeMock, *config.Config) {
 	t.Helper()
@@ -114,8 +146,15 @@ func newLifeServer(t *testing.T) (*lifeMock, *config.Config) {
 	})
 	mux.HandleFunc("/api/v5/account/balance", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
+		m.balanceCalls++
+		fail := m.balanceFailFrom > 0 && m.balanceCalls >= m.balanceFailFrom
 		usdt, usdtA, btc, btcA := m.usdtTotal, m.usdtAvail, m.btcTotal, m.btcAvail
+		m.hits = append(m.hits, "balance")
 		m.mu.Unlock()
+		if fail {
+			json.NewEncoder(w).Encode(map[string]any{"code": "1", "msg": "mock balance fail"})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": []map[string]any{{
 			"details": []map[string]string{
 				{"ccy": "USDT", "availBal": fmt.Sprintf("%g", usdtA), "cashBal": fmt.Sprintf("%g", usdt), "frozenBal": fmt.Sprintf("%g", usdt-usdtA)},
@@ -145,6 +184,7 @@ func newLifeServer(t *testing.T) (*lifeMock, *config.Config) {
 	})
 	mux.HandleFunc("/api/v5/trade/orders-pending", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
+		m.hits = append(m.hits, "orders-pending")
 		rows := append([]map[string]string(nil), m.pending...)
 		m.mu.Unlock()
 		if rows == nil {
@@ -156,15 +196,22 @@ func newLifeServer(t *testing.T) (*lifeMock, *config.Config) {
 		var body map[string]string
 		json.NewDecoder(r.Body).Decode(&body)
 		m.mu.Lock()
-		m.cancels++
-		kept := m.pending[:0]
-		for _, row := range m.pending {
-			if row["ordId"] != body["ordId"] {
-				kept = append(kept, row)
+		fail := m.cancelFail
+		if !fail {
+			m.cancels++
+			kept := m.pending[:0]
+			for _, row := range m.pending {
+				if row["ordId"] != body["ordId"] {
+					kept = append(kept, row)
+				}
 			}
+			m.pending = kept
 		}
-		m.pending = kept
 		m.mu.Unlock()
+		if fail {
+			json.NewEncoder(w).Encode(map[string]any{"code": "1", "msg": "mock cancel fail"})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": []map[string]string{
 			{"ordId": body["ordId"], "sCode": "0", "sMsg": ""},
 		}})
@@ -528,5 +575,285 @@ func TestStartupPersistsStateImmediately(t *testing.T) {
 	}
 	if st.Day == "" || st.DayStartEq != 10005 {
 		t.Fatalf("落盘应含日内基线: %+v", st)
+	}
+}
+
+// TestStartupBalanceFetchAfterAdopt RISK-2 回归：余额拉取（T1）必须晚于在途单
+// 认领（T0 拉挂单）——(T0,T1] 窗口内的成交已含在 T1 余额里，重建账本无丢失窗口。
+// 修复前 balance 在 buildApp 顶部先拉（早于 adopt），断言 firstHit 顺序可捕获。
+func TestStartupBalanceFetchAfterAdopt(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	if i := m.firstHit("orders-pending"); i < 0 {
+		t.Fatal("paper 启动必须拉取在途单（adopt）")
+	}
+	if b, p := m.firstHit("balance"), m.firstHit("orders-pending"); b < p {
+		t.Fatalf("余额拉取必须晚于在途单认领（balance@%d < orders-pending@%d）——先拉余额会丢 (T0,T1] 窗口成交", b, p)
+	}
+}
+
+// TestReconcileNeverSucceededBlocks RISK-3 回归：从未成功对账（lastRec 零值）+
+// 余额拉取失败 → fail-closed 拦截下单（修复前 fail-open 照常交易）。
+func TestReconcileNeverSucceededBlocks(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	cfg.Risk.CooldownAfterRejectSec = 0 // 拒单默认带 30s 冷静期，会盖住后续断言
+	// 第 1 次 balance（Seed 拉取）成功、第 2 次（启动强制对账）失败 → lastRec 零值
+	m.setBalanceFailFrom(2)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	blocked, reason := a.rk.ReconcileBlocked()
+	if !blocked || !strings.Contains(reason, "对账从未成功") {
+		t.Fatalf("从未成功对账必须拦截下单: blocked=%v reason=%q", blocked, reason)
+	}
+	if _, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 50, Qty: 0.01, ClientOrderID: "t-neverrec-1",
+	}); serr == nil || !strings.Contains(serr.Error(), "RECONCILE_BLOCK") {
+		t.Fatalf("对账从未成功期间下单必须被拒: %v", serr)
+	}
+	// 拉取恢复 + 对账一致 → 自动解除
+	m.setBalanceFailFrom(0)
+	if _, ok, err := a.reconcileOnce(context.Background()); err != nil || !ok {
+		t.Fatalf("恢复后对账应通过: ok=%v err=%v", ok, err)
+	}
+	if blocked, _ := a.rk.ReconcileBlocked(); blocked {
+		t.Fatal("对账成功后拦截必须解除")
+	}
+}
+
+// TestReconcileConsecutiveFailuresBlock RISK-3：成功过一次后短暂拉取失败宽容
+// （不拦截），连续 ≥3 次 → 拦截；恢复后解除。
+func TestReconcileConsecutiveFailuresBlock(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	if blocked, _ := a.rk.ReconcileBlocked(); blocked {
+		t.Fatal("前置失败：启动对账成功不应拦截")
+	}
+	// 启动已用掉 2 次 balance 调用，从第 3 次开始失败
+	m.setBalanceFailFrom(3)
+	for i := 1; i <= 2; i++ {
+		if _, _, rerr := a.reconcileOnce(context.Background()); rerr == nil {
+			t.Fatalf("第 %d 次应拉取失败", i)
+		}
+		if blocked, _ := a.rk.ReconcileBlocked(); blocked {
+			t.Fatalf("成功过一次后的短暂失败（%d 次）不应拦截", i)
+		}
+	}
+	if _, _, _ = a.reconcileOnce(context.Background()); true {
+		blocked, reason := a.rk.ReconcileBlocked()
+		if !blocked || !strings.Contains(reason, "连续失败") {
+			t.Fatalf("连续 3 次拉取失败必须拦截: blocked=%v reason=%q", blocked, reason)
+		}
+	}
+	// 恢复 → 解除 + 计数清零（下一次单次失败不再立即拦截）
+	m.setBalanceFailFrom(0)
+	if _, ok, rerr := a.reconcileOnce(context.Background()); rerr != nil || !ok {
+		t.Fatalf("恢复后对账应通过: ok=%v err=%v", ok, rerr)
+	}
+	if blocked, _ := a.rk.ReconcileBlocked(); blocked {
+		t.Fatal("恢复后拦截必须解除")
+	}
+	m.setBalanceFailFrom(99)
+	if _, _, _ = a.reconcileOnce(context.Background()); true {
+		if blocked, _ := a.rk.ReconcileBlocked(); blocked {
+			t.Fatal("计数清零后单次失败不应拦截")
+		}
+	}
+}
+
+// TestKillRestoreCancelsLeftoverOrders RISK-4 回归：Kill 态跨重启恢复时补撤上次
+// 遗留挂单（进程被杀撤单链未执行完），不留孤儿单在场。
+func TestKillRestoreCancelsLeftoverOrders(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	// 预置：Kill 已触发 + 交易所遗留一张在途单（上次 Kill 撤单没执行完）
+	if err := state.New(cfg.DataDir).Save(state.Runtime{Version: 1, KillTripped: true, KillReason: "演练停机"}); err != nil {
+		t.Fatal(err)
+	}
+	m.addPending(pendingRow("ex-left", "manual-left"))
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	if !a.rk.Kill.Tripped() || a.rk.Kill.Reason() != "演练停机" {
+		t.Fatal("Kill 态必须恢复")
+	}
+	if c := m.cancelCount(); c != 1 {
+		t.Fatalf("Kill 态恢复应补撤遗留挂单 1 张: %d", c)
+	}
+	if n := len(a.exec.OpenOrders()); n != 0 {
+		t.Fatalf("补撤后本地挂单簿应清空: %d", n)
+	}
+}
+
+// TestKillRestoreCancelAlerts RISK-4：补撤单必告警留痕；撤单失败（CancelAll 返回
+// 0 且期望 >0）追加不完整告警，人工兜底。
+func TestKillRestoreCancelAlerts(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	cap := &captureNotifier{}
+	a.notifier = cap
+	if _, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 50, Qty: 0.01, ClientOrderID: "t-killrec-1",
+	}); serr != nil {
+		t.Fatalf("前置下单失败: %v", serr)
+	}
+	m.setCancelFail(true) // 撤单全失败 → CancelAll 实撤 0
+	a.killRestoreCancel("演练停机")
+	msgs := cap.sent()
+	if len(msgs) != 2 {
+		t.Fatalf("应有补撤告警 + 不完整告警各一条: %v", msgs)
+	}
+	if !strings.Contains(msgs[0], "Kill 态跨重启恢复") || !strings.Contains(msgs[0], "补撤") {
+		t.Fatalf("首条应为补撤留痕告警: %q", msgs[0])
+	}
+	if !strings.Contains(msgs[1], "不完整") || !strings.Contains(msgs[1], "期望 1 实撤 0") {
+		t.Fatalf("撤单不完整告警格式错误: %q", msgs[1])
+	}
+}
+
+// TestGracefulShutdownAlertsOnIncompleteCancel RISK-7 回归：优雅退出撤单失败不得
+// 静默——与撤单前本地挂单数比对，不完整即告警。
+func TestGracefulShutdownAlertsOnIncompleteCancel(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &captureNotifier{}
+	a.notifier = cap
+	if _, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 50, Qty: 0.01, ClientOrderID: "t-shutdown-incomplete",
+	}); serr != nil {
+		t.Fatalf("前置下单失败: %v", serr)
+	}
+	m.setCancelFail(true)
+	a.gracefulShutdown(nil)
+	msgs := cap.sent()
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "优雅退出撤单可能不完整") || !strings.Contains(msgs[0], "期望 1 实撤 0") {
+		t.Fatalf("撤单不完整必须告警: %v", msgs)
+	}
+}
+
+// TestKillTripCancelAlertsIncomplete RISK-7：Kill 触发链的撤单同样做完整性比对，
+// 失败不静默。
+func TestKillTripCancelAlertsIncomplete(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	cap := &captureNotifier{}
+	a.notifier = cap
+	if _, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 50, Qty: 0.01, ClientOrderID: "t-killtrip-1",
+	}); serr != nil {
+		t.Fatalf("前置下单失败: %v", serr)
+	}
+	m.setCancelFail(true)
+	a.rk.Kill.Trip("演练停机")
+	// OnTrip 撤单在后台 goroutine，轮询等告警落地
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, msg := range cap.sent() {
+			if strings.Contains(msg, "Kill 触发撤单可能不完整") && strings.Contains(msg, "期望 1 实撤 0") {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("Kill 触发撤单不完整必须告警: %v", cap.sent())
+}
+
+// TestGracefulShutdownHTTPFirst RISK-6 回归：httpSrv.Shutdown 必须最先执行——
+// in-flight handler 未返回（Shutdown 阻塞等待）期间不得开始撤单，drain 期间
+// 手动下单等写入口先被关闭；退出后新请求被拒绝。
+func TestGracefulShutdownHTTPFirst(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	for i := 0; i < 2; i++ {
+		if _, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+			Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+			Price: 50, Qty: 0.01, ClientOrderID: fmt.Sprintf("t-httpfirst-%d", i),
+		}); serr != nil {
+			t.Fatalf("前置下单失败: %v", serr)
+		}
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(started) })
+		<-release
+		w.WriteHeader(200)
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := &http.Server{Handler: mux}
+	go hs.Serve(ln)
+	base := "http://" + ln.Addr().String()
+
+	go func() {
+		resp, cerr := http.Get(base + "/slow")
+		if cerr == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("前置失败：in-flight 请求未启动")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		a.gracefulShutdown(hs)
+		close(done)
+	}()
+	// in-flight handler 阻塞期间：HTTP Shutdown 在等它 → 撤单尚未开始
+	// （若实现是先撤单后关 HTTP，此处 cancelCount 会立刻变成 2）。
+	time.Sleep(200 * time.Millisecond)
+	if c := m.cancelCount(); c != 0 {
+		t.Fatalf("HTTP 未关闭前不得开始撤单（in-flight handler 仍在处理）: cancels=%d", c)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gracefulShutdown 未在预算内完成")
+	}
+	if c := m.cancelCount(); c != 2 {
+		t.Fatalf("HTTP 关闭后应完成撤单 2 张: %d", c)
+	}
+	// 退出后新请求被拒绝（监听已关）
+	if resp, cerr := http.Get(base + "/api/status"); cerr == nil {
+		resp.Body.Close()
+		t.Fatal("drain 完成后不得再接受新请求")
 	}
 }

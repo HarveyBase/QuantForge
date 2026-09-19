@@ -123,7 +123,7 @@ func TestGridEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Grid = g
+	s.GridFn = func() *grid.Grid { return g }
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/api/grid")
@@ -136,12 +136,56 @@ func TestGridEndpoint(t *testing.T) {
 	if body["levels"] == nil || body["stats"] == nil {
 		t.Fatalf("grid 端点应返回网格线与统计: %v", body)
 	}
-	// nil 网格返回空对象
-	s.Grid = nil
+	// GridFn 返回 nil 实例：空对象不 500
+	s.GridFn = func() *grid.Grid { return nil }
 	resp2, _ := http.Get(srv.URL + "/api/grid")
 	resp2.Body.Close()
 	if resp2.StatusCode != 200 {
 		t.Fatalf("nil grid 应 200 空对象: %d", resp2.StatusCode)
+	}
+	// 未注入 GridFn 同样安全
+	s.GridFn = nil
+	resp3, _ := http.Get(srv.URL + "/api/grid")
+	resp3.Body.Close()
+	if resp3.StatusCode != 200 {
+		t.Fatalf("未注入 GridFn 应 200 空对象: %d", resp3.StatusCode)
+	}
+}
+
+// TestGridEndpointFollowsCurrentInstance RISK-9：GridFn 每次取当前实例——
+// 策略热切换替换 grid 实例后，/api/grid 必须反映新实例（旧字段注入会失联）。
+func TestGridEndpointFollowsCurrentInstance(t *testing.T) {
+	s := newServerForTest(t)
+	g1, err := grid.New(grid.Params{Lower: 100, Upper: 200, Grids: 4, QtyPerGrid: 0.1, Spacing: "arith"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g2, err := grid.New(grid.Params{Lower: 300, Upper: 400, Grids: 4, QtyPerGrid: 0.1, Spacing: "arith"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := g1
+	s.GridFn = func() *grid.Grid { return cur }
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	get := func() []float64 {
+		resp, err := http.Get(srv.URL + "/api/grid")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Levels []float64 `json:"levels"`
+		}
+		json.NewDecoder(resp.Body).Decode(&body)
+		return body.Levels
+	}
+	if lv := get(); len(lv) == 0 || lv[0] != 100 {
+		t.Fatalf("初始应返回 g1 网格线（下界 100）: %v", lv)
+	}
+	cur = g2 // 模拟热切换替换实例
+	if lv := get(); len(lv) == 0 || lv[0] != 300 {
+		t.Fatalf("切换后必须返回新实例 g2 网格线（下界 300）: %v", lv)
 	}
 }
 

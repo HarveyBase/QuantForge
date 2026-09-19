@@ -38,7 +38,10 @@ func New(seedCash float64) *Portfolio {
 	return &Portfolio{Cash: seedCash, Positions: map[string]*Position{}, marks: map[string]float64{}, freezes: map[string]freezeEntry{}}
 }
 
-// Seed 用交易所余额初始化现货账本。余额中的 Available 用于可交易资产。
+// Seed 用交易所余额初始化现货账本。
+// 账本 Qty 记总持仓（= 余额 Total）、Available 记交易所可用（= 余额 Available）：
+// 认领了挂卖单（交易所冻结 q）后重启，Qty=C−q vs 远程 Total=C 会产生永久对账差异；
+// 冻结语义由本地 freezes 承担（卖单冻结扣 Available），两种口径各自对齐远程字段。
 // 同时登记主交易对与 Base/Quote 币种，供手续费分账（FeeCcy 比对）与结构化对账使用。
 func (p *Portfolio) Seed(balances []exchange.Balance, symbol, base, quote string, mark float64) {
 	p.mu.Lock()
@@ -48,13 +51,25 @@ func (p *Portfolio) Seed(balances []exchange.Balance, symbol, base, quote string
 		if b.Asset == quote {
 			p.Cash = b.Available
 		}
-		if b.Asset == base && b.Available > 0 {
-			p.Positions[symbol] = &Position{Symbol: symbol, Qty: b.Available, Available: b.Available, AvgPrice: mark}
+		if b.Asset == base && b.Total > 0 {
+			p.Positions[symbol] = &Position{Symbol: symbol, Qty: b.Total, Available: b.Available, AvgPrice: mark}
 		}
 	}
 	if mark > 0 {
 		p.marks[base] = mark
 	}
+}
+
+// Reset 账本清零（现金/持仓/标记价/冻结四清）：启动 Seed 前清掉恢复阶段打到
+// 未初始化账本上的增量（停机期间的成交已含在交易所余额里，Seed 以余额为唯一
+// 权威重建）。替代调用方直写导出字段。
+func (p *Portfolio) Reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Cash = 0
+	p.Positions = map[string]*Position{}
+	p.marks = map[string]float64{}
+	p.freezes = map[string]freezeEntry{}
 }
 
 func (p *Portfolio) UpdateMark(symbol string, price float64) {
@@ -404,8 +419,8 @@ func withinTol(local, remote float64) bool {
 }
 
 // ReconcileDetail 结构化对账（新代码请优先使用，旧 Reconcile 保留兼容）：
-// 远程 balances 按币种映射后，比对 ①现金（Quote 币 Total，缺失按 0 计）
-// ②每个本地持仓的 Qty/Available ③本地无持仓但远程余额超容差的 Base 币。
+// 远程 balances 按币种映射后，比对 ①现金（本地可用 + Σ买单冻结 vs Quote 币 Total，
+// 缺失按 0 计）②每个本地持仓的 Qty/Available ③本地无持仓但远程余额超容差的 Base 币。
 func (p *Portfolio) ReconcileDetail(balances []exchange.Balance) ReconcileReport {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -415,10 +430,18 @@ func (p *Portfolio) ReconcileDetail(balances []exchange.Balance) ReconcileReport
 		remote[b.Asset] = b
 	}
 	quote := p.quoteOfLocked()
-	// ① 现金：远程计价币余额（远程缺失该币种视为 0）
+	// ① 现金：本地 Cash 是已扣买单冻结的"可用"口径，而远程 Total 含在途买单冻结——
+	// 比对口径必须对齐：本地可用 + Σ买单冻结 ≈ 交易所 Total。否则挂一张 100 USDT
+	// 买单即报 diff 100，网格常态被 RECONCILE_BLOCK 误拦。
+	localCash := p.Cash
+	for _, f := range p.freezes {
+		if f.req.Side == exchange.Buy {
+			localCash += f.req.Price * f.remaining
+		}
+	}
 	qb := remote[quote]
-	if !withinTol(p.Cash, qb.Total) {
-		report.Diffs = append(report.Diffs, ReconcileDiff{Kind: DiffCash, Item: quote, Local: p.Cash, Remote: qb.Total, Diff: qb.Total - p.Cash})
+	if !withinTol(localCash, qb.Total) {
+		report.Diffs = append(report.Diffs, ReconcileDiff{Kind: DiffCash, Item: quote, Local: localCash, Remote: qb.Total, Diff: qb.Total - localCash})
 	}
 	// ② 每个本地持仓：数量与可用双比对（远程按该持仓的 Base 币余额）
 	seenBase := make(map[string]bool, len(p.Positions))
