@@ -181,14 +181,44 @@ func (m *Manager) CheckOrder(req exchange.OrderRequest, markPrice float64) error
 			return m.reject(req, "INSUFFICIENT_AVAILABLE", "可卖 %.8f 不足（委托 %.8f）", available, req.Qty)
 		}
 	}
-	if eq := m.Pf.Equity(); m.dayStartEq > 0 && eq < m.dayStartEq*(1-m.Limits.MaxDailyLossPct/100) {
-		reason := fmt.Sprintf("当日回撤超 %.1f%%: %.2f -> %.2f", m.Limits.MaxDailyLossPct, m.dayStartEq, eq)
-		m.Kill.Trip(reason)
+	if tripped, _, eq := m.evaluateDailyLossLocked(); tripped {
 		return m.reject(req, "MAX_DAILY_LOSS", "当日权益 %.2f 较起始 %.2f 回撤超限，自动停机", eq, m.dayStartEq)
 	}
 	m.orderTimes = append(m.orderTimes, now)
 	m.dailyNotional += notional
 	return nil
+}
+
+// evaluateDailyLossLocked 当日回撤评估的共享实现（调用方必须已持有 m.mu，
+// CheckOrder 与 EvaluateDailyLoss 分别在自己的锁内调用，避免双重加锁死锁）。
+// 返回：是否超限、Kill 留痕原因、当前权益。
+func (m *Manager) evaluateDailyLossLocked() (tripped bool, reason string, eq float64) {
+	eq = m.Pf.Equity()
+	// dayStartEq <= 0 时跳过检查（除零保护，与既有 CheckOrder 口径一致）
+	if m.dayStartEq <= 0 || eq >= m.dayStartEq*(1-m.Limits.MaxDailyLossPct/100) {
+		return false, "", eq
+	}
+	reason = fmt.Sprintf("当日回撤超 %.1f%%: %.2f -> %.2f", m.Limits.MaxDailyLossPct, m.dayStartEq, eq)
+	m.Kill.Trip(reason)
+	return true, reason, eq
+}
+
+// EvaluateDailyLoss 权益看门狗入口：策略不出单时也独立巡检当日回撤，
+// 超限则触发 Kill Switch（原因经 KillSwitch 留痕并广播 OnTrip 监听）。
+// 仅触发停机、不拒单（拒单与拒单台账是 CheckOrder 的职责），返回是否超限与原因。
+func (m *Manager) EvaluateDailyLoss() (tripped bool, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rollDayIfNeeded()
+	tripped, reason, _ = m.evaluateDailyLossLocked()
+	return tripped, reason
+}
+
+// EquityBaseline 只读查询当日基线（看门狗巡检/落盘用）：日标签与日起始权益。
+func (m *Manager) EquityBaseline() (day string, dayStartEq float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.day, m.dayStartEq
 }
 
 func (m *Manager) OnOrderAccepted(exchange.OrderRequest) {}
