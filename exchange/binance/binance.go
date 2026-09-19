@@ -33,19 +33,25 @@ type Client struct {
 	APIKey  string
 	Secret  string
 	HTTP    *http.Client
+	limiter *rateLimiter // REST 限速器（do 入口 acquire；nil = 不限速，New 默认 10 req/s）
 }
 
 // New 构造（Key 走环境变量 BINANCE_API_KEY / BINANCE_SECRET）。
-func New() *Client { return NewWithURL(defaultBaseURL) }
+func New(opts ...Option) *Client { return NewWithURL(defaultBaseURL, opts...) }
 
 // NewWithURL 自定义 base URL（测试注入 mock）。
-func NewWithURL(baseURL string) *Client {
-	return &Client{
+func NewWithURL(baseURL string, opts ...Option) *Client {
+	c := &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  os.Getenv(envAPIKey),
 		Secret:  os.Getenv(envSecret),
 		HTTP:    &http.Client{Timeout: 15 * time.Second},
+		limiter: newRateLimiter(defaultRatePerSec),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 func (c *Client) Name() string { return "binance" }
@@ -61,6 +67,9 @@ func (c *Client) sign(query string) string {
 
 // do 发请求。signed=true 时追加 timestamp+recvWindow 并签名（query 签名）。
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, signed bool) ([]byte, error) {
+	if err := c.limiter.acquire(ctx); err != nil { // REST 入口限速；ctx 取消立即失败，绝不死等
+		return nil, err
+	}
 	if signed {
 		if !c.hasCreds() {
 			return nil, fmt.Errorf("binance: 签名接口需要 API Key（环境变量 %s/%s）", envAPIKey, envSecret)
@@ -97,7 +106,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		return nil, fmt.Errorf("binance: 读取响应失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("binance: %s HTTP %d: %.200s", path, resp.StatusCode, data)
+		return nil, httpStatusError(path, resp.StatusCode, data) // 429/限流码 → ErrRateLimited；418 → 注明 IP 封禁
 	}
 	return data, nil
 }

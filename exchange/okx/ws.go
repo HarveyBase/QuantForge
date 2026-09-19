@@ -16,7 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// WSCandles candle 频道订阅客户端（自动重连，退避 5s→30s）。
+// WSCandles candle 频道订阅客户端（自动重连，退避 5s→30s，连接成功后复位回 5s）。
 type WSCandles struct {
 	URL      string // 默认 wss://ws.okx.com:8443/ws/v5/public
 	Symbol   string
@@ -46,40 +46,67 @@ func (w *WSCandles) WithHandler(onClosed func(int64), onError func(error)) *WSCa
 	return w
 }
 
+// wsBackoff 断线重连退避：初始 5s，连续失败每次 +5s，上限 30s；
+// 上次连接成功建立过则复位回初始值（长时间稳定运行后的偶发断线不应继承历史退避）。
+type wsBackoff struct {
+	next          time.Duration // 下次断线应等待的时长
+	initial, step time.Duration
+	max           time.Duration
+}
+
+func newWSBackoff() *wsBackoff {
+	return &wsBackoff{
+		next: 5 * time.Second, initial: 5 * time.Second,
+		step: 5 * time.Second, max: 30 * time.Second,
+	}
+}
+
+// wait 返回本次断线后应等待的时长，并推进内部状态。
+// hadConnected 表示断开的那次连接是否成功建立过（成功过 → 复位回初始值）。
+func (b *wsBackoff) wait(hadConnected bool) time.Duration {
+	if hadConnected {
+		b.next = b.initial // 复位：连接成功说明网络已恢复，重新从初始退避开始
+	}
+	w := b.next
+	if b.next < b.max {
+		b.next += b.step
+	}
+	return w
+}
+
 // Run 阻塞运行直到 ctx 取消；断线自动重连（REST 轮询兜底期间不影响交易）。
 func (w *WSCandles) Run(ctx context.Context) {
-	backoff := 5 * time.Second
+	backoff := newWSBackoff()
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		err := w.runOnce(ctx)
+		hadConnected, err := w.runOnce(ctx)
 		if ctx.Err() != nil {
 			return
 		}
+		wait := backoff.wait(hadConnected) // 连接成功过 → 复位回初始值再等待
 		if w.OnError != nil {
-			w.OnError(fmt.Errorf("ws 断开（%.0fs 后重连）: %w", backoff.Seconds(), err))
+			w.OnError(fmt.Errorf("ws 断开（%.0fs 后重连）: %w", wait.Seconds(), err))
 		} else {
-			log.Printf("okx ws 断开（%.0fs 后重连）: %v", backoff.Seconds(), err)
+			log.Printf("okx ws 断开（%.0fs 后重连）: %v", wait.Seconds(), err)
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff += 5 * time.Second
+		case <-time.After(wait):
 		}
 	}
 }
 
-func (w *WSCandles) runOnce(ctx context.Context) error {
+func (w *WSCandles) runOnce(ctx context.Context) (hadConnected bool, err error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	conn, _, err := w.dialer.DialContext(dialCtx, w.URL, nil)
-	if err != nil {
-		return err
+	conn, _, dialErr := w.dialer.DialContext(dialCtx, w.URL, nil)
+	if dialErr != nil {
+		return false, dialErr
 	}
+	hadConnected = true // 连接已成功建立：后续断线的 backoff 应从初始值重新起算
 	defer conn.Close()
 
 	// 订阅 candle 频道
@@ -89,7 +116,7 @@ func (w *WSCandles) runOnce(ctx context.Context) error {
 	}
 	b, _ := json.Marshal(sub)
 	if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
-		return err
+		return hadConnected, err
 	}
 	// 心跳：服务端 ping 用 text "pong" 应答（OKX 约定）
 	go func() {
@@ -109,11 +136,11 @@ func (w *WSCandles) runOnce(ctx context.Context) error {
 
 	for {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return hadConnected, ctx.Err()
 		}
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			return err
+			return hadConnected, err
 		}
 		var env struct {
 			Event string `json:"event"`

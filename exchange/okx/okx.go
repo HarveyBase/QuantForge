@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/HarveyBase/QuantForge/exchange"
@@ -44,38 +45,51 @@ type Client struct {
 	Leverage   float64
 	cacheMu    sync.Mutex
 	contracts  map[string]float64
+
+	limiter       *rateLimiter // REST 限速器（do 入口 acquire；nil = 不限速，构造函数默认 10 req/s）
+	clockOffset   atomic.Int64 // 与 OKX 服务器时钟偏移（毫秒），签名时间戳用
+	calibrated    atomic.Bool  // 时钟是否已成功校准
+	calibrateOnce sync.Once    // 首次签名请求前的自动校准只做一次
 }
 
 // NewLive 生产环境客户端，Key 从环境变量读取。
-func NewLive(tdMode string, leverage float64) *Client {
-	return NewLiveWithURL(defaultBaseURL, tdMode, leverage)
+func NewLive(tdMode string, leverage float64, opts ...Option) *Client {
+	return NewLiveWithURL(defaultBaseURL, tdMode, leverage, opts...)
 }
 
-func NewLiveWithURL(baseURL, tdMode string, leverage float64) *Client {
+func NewLiveWithURL(baseURL, tdMode string, leverage float64, opts ...Option) *Client {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL
 	}
-	return &Client{
+	c := &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"), TdMode: tdMode, Leverage: leverage,
 		APIKey: os.Getenv(envAPIKey), Secret: os.Getenv(envSecret), Passphrase: os.Getenv(envPassphrase),
 		HTTP: &http.Client{Timeout: 15 * time.Second}, contracts: map[string]float64{},
+		limiter: newRateLimiter(defaultRatePerSec),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // NewPaper 演示环境（demo trading）客户端：与实盘同一套代码，仅多一个模拟头。
-func NewPaper(tdMode string, leverage float64) *Client {
-	return NewPaperWithURL(defaultBaseURL, tdMode, leverage)
+func NewPaper(tdMode string, leverage float64, opts ...Option) *Client {
+	return NewPaperWithURL(defaultBaseURL, tdMode, leverage, opts...)
 }
 
-func NewPaperWithURL(baseURL, tdMode string, leverage float64) *Client {
-	c := NewLiveWithURL(baseURL, tdMode, leverage)
+func NewPaperWithURL(baseURL, tdMode string, leverage float64, opts ...Option) *Client {
+	c := NewLiveWithURL(baseURL, tdMode, leverage, opts...)
 	c.Simulated = true
 	return c
 }
 
 // NewPublic 仅公开行情（无 Key 也能跑 research 数据面）。
-func NewPublic() *Client                      { return NewPublicWithURL(defaultBaseURL) }
-func NewPublicWithURL(baseURL string) *Client { return NewLiveWithURL(baseURL, "cross", 1) }
+func NewPublic(opts ...Option) *Client { return NewPublicWithURL(defaultBaseURL, opts...) }
+
+func NewPublicWithURL(baseURL string, opts ...Option) *Client {
+	return NewLiveWithURL(baseURL, "cross", 1, opts...)
+}
 
 func (c *Client) HasCredentials() bool { return c.hasCreds() }
 
@@ -95,6 +109,9 @@ func (c *Client) sign(ts, method, path, body string) string {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any, needAuth bool) ([]byte, error) {
+	if err := c.limiter.acquire(ctx); err != nil { // REST 入口限速；ctx 取消立即失败，绝不死等
+		return nil, err
+	}
 	if query != nil && len(query) > 0 {
 		path += "?" + query.Encode()
 	}
@@ -115,7 +132,9 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		if !c.hasCreds() {
 			return nil, fmt.Errorf("okx: %s", fmt.Sprintf(credMissingHint, envAPIKey, envSecret, envPassphrase))
 		}
-		ts := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+		// 首次签名前自动校准时钟（尽力而为，失败忽略：offset 保持 0，与未校准行为一致）
+		c.ensureClockCalibrated()
+		ts := c.now().Format("2006-01-02T15:04:05.000Z") // 服务器校准时间，防本地时钟漂移致签名失效
 		req.Header.Set("OK-ACCESS-KEY", c.APIKey)
 		req.Header.Set("OK-ACCESS-SIGN", c.sign(ts, method, path, string(reqBody)))
 		req.Header.Set("OK-ACCESS-TIMESTAMP", ts)
@@ -134,6 +153,10 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		return nil, fmt.Errorf("okx: 读取响应失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			// 限流信号：打上 ErrRateLimited 标记，execution 层据此进入可重试分支
+			return nil, fmt.Errorf("okx: %s HTTP %d 触发限流: %.200s: %w", path, resp.StatusCode, data, exchange.ErrRateLimited)
+		}
 		return nil, fmt.Errorf("okx: %s HTTP %d: %.200s", path, resp.StatusCode, data)
 	}
 	var env struct {
@@ -144,6 +167,10 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		return nil, fmt.Errorf("okx: 解析响应失败: %w", err)
 	}
 	if env.Code != "0" {
+		if okxRateLimitCodes[env.Code] {
+			// 限流类业务码：打上 ErrRateLimited 标记（保留原始 code/msg 文本）
+			return nil, fmt.Errorf("okx: %s 限流业务错误 code=%s msg=%s: %w", path, env.Code, env.Msg, exchange.ErrRateLimited)
+		}
 		return nil, fmt.Errorf("okx: %s 业务错误 code=%s msg=%s", path, env.Code, env.Msg)
 	}
 	return data, nil
