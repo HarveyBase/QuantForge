@@ -1,0 +1,44 @@
+# QuantForge systemd 部署单元（生产实盘参考）
+
+# 安装：
+#   1. make build && sudo cp bin/quantforge /usr/local/bin/
+#   2. sudo cp deploy/quantforge.service /etc/systemd/system/
+#   3. sudo cp config.example.json /etc/quantforge/config.json  # 按需修改
+#   4. sudo systemctl daemon-reload && sudo systemctl enable --now quantforge
+#
+# 密钥一律走 EnvironmentFile（0600 权限，绝不写进 config.json）：
+#   sudo install -m 600 /dev/null /etc/quantforge/env
+#   编辑写入 OKX_API_KEY=... / OKX_SECRET=... / OKX_PASSPHRASE=...
+#   （可选告警）TG_BOT_TOKEN=... / TG_CHAT_ID=...
+#   （实盘门禁）QUANTFORGE_ALLOW_LIVE=I_UNDERSTAND_THE_RISK
+#
+# 注意：
+#   - Restart=on-failure + RestartSec=15：崩溃自动拉起。启动恢复编排会先重放 journal、
+#     认领交易所在途挂单、做账户对账，对账不过会被 RECONCILE_BLOCK 冻结下单（人工介入）。
+#   - TimeoutStopSec=35：优雅退出预算 30s（撤单 + 落盘），systemd 层再留 5s 余量。
+
+[Unit]
+Description=QuantForge quant trading framework (backtest/paper/live pipeline)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quantforge
+Group=quantforge
+WorkingDirectory=/var/lib/quantforge
+ExecStart=/usr/local/bin/quantforge serve -config /etc/quantforge/config.json
+EnvironmentFile=/etc/quantforge/env
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=35
+
+# 沙箱加固（安全红线：密钥与数据目录隔离）
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quantforge
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
