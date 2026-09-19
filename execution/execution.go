@@ -18,7 +18,13 @@ const (
 	maxRetries     = 3
 	retryBaseDelay = 500 * time.Millisecond
 	reconcileEvery = 3 * time.Second
+
+	rateLimitBackoffMax = 30 * time.Second // 限流退避上限
 )
+
+// rateLimitBackoff 限流退避基数（至少 5s，远长于普通指数退避：限流下重锤只会更糟）。
+// 变量便于测试缩短，生产值 5s。
+var rateLimitBackoff = 5 * time.Second
 
 type Event struct {
 	Ts         time.Time      `json:"ts"`
@@ -39,6 +45,7 @@ type Executor struct {
 	claimed   map[string]bool
 	inflight  map[string]bool
 	events    []Event
+	journal   *Journal // 事件溯源日志（可选；挂载后内存表变更逐点落盘）
 	onEvent   func(Event)
 	cancelCtx context.Context
 	stopFn    context.CancelFunc
@@ -71,12 +78,13 @@ func (e *Executor) Submit(ctx context.Context, req exchange.OrderRequest) (excha
 	}
 	var lastErr error
 	attempts := 0 // 实际重试次数（不可重试错误为 0）
+	delay := time.Duration(0)
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return exchange.Order{}, ctx.Err()
-			case <-time.After(retryBaseDelay << attempt):
+			case <-time.After(delay):
 			}
 		}
 		if e.Rk.Kill.Tripped() {
@@ -100,10 +108,16 @@ func (e *Executor) Submit(ctx context.Context, req exchange.OrderRequest) (excha
 			return o, nil
 		}
 		lastErr = err
+		if exchange.IsRateLimitError(err) {
+			attempts++
+			delay = min(rateLimitBackoff<<(attempt+1), rateLimitBackoffMax) // 限流退避远长于普通退避
+			continue
+		}
 		if retryable(err) {
 			if attempt > 0 {
 				attempts++
 			}
+			delay = retryBaseDelay << (attempt + 1)
 			if found, qerr := e.Ex.GetOrderByClientID(ctx, req.Symbol, req.ClientOrderID); qerr == nil {
 				if found.ClientOrderID == "" {
 					found.ClientOrderID = req.ClientOrderID
@@ -114,6 +128,18 @@ func (e *Executor) Submit(ctx context.Context, req exchange.OrderRequest) (excha
 				return exchange.Order{}, fmt.Errorf("execution: 找到订单但登记失败 %s", req.ClientOrderID)
 			}
 			continue
+		}
+		// 不可重试但疑似"重复 clientOrderID"（交易所实际已收单，重启/重试窗口内常见）：
+		// 仍查后补一次，防止误报失败导致上层重复下单。
+		if duplicateOrderErr(err) {
+			if found, qerr := e.Ex.GetOrderByClientID(ctx, req.Symbol, req.ClientOrderID); qerr == nil && found.OrderID != "" {
+				if found.ClientOrderID == "" {
+					found.ClientOrderID = req.ClientOrderID
+				}
+				if e.register(found, req) {
+					return found, nil
+				}
+			}
 		}
 		break
 	}
@@ -129,6 +155,7 @@ func (e *Executor) register(o exchange.Order, req exchange.OrderRequest) bool {
 	e.claimed[req.ClientOrderID] = true
 	e.orders[o.OrderID] = o
 	e.byClient[req.ClientOrderID] = o.OrderID
+	e.journalEvent("register", o)
 	e.mu.Unlock()
 	if o.Status == exchange.StatusSubmitted || o.Status == exchange.StatusPartiallyFilled {
 		if req.Type == exchange.OrderLimit && !e.Pf.Freeze(req) {
@@ -148,6 +175,7 @@ func (e *Executor) removeOrder(id string) {
 	e.mu.Lock()
 	if o, ok := e.orders[id]; ok {
 		delete(e.claimed, o.ClientOrderID)
+		e.journalEvent("remove", o)
 	}
 	delete(e.orders, id)
 	e.mu.Unlock()
@@ -160,6 +188,7 @@ func (e *Executor) Cancel(ctx context.Context, symbol, orderID string) error {
 	e.mu.Lock()
 	o := e.orders[orderID]
 	delete(e.orders, orderID)
+	e.journalEvent("cancel", o)
 	e.mu.Unlock()
 	e.releaseFreeze(o)
 	e.emit(Event{Ts: time.Now(), Kind: "cancelled", Order: o})
@@ -226,6 +255,7 @@ func (e *Executor) applyUpdate(fresh exchange.Order) {
 		return
 	}
 	e.orders[fresh.OrderID] = fresh
+	e.journalEvent("update", fresh)
 	e.mu.Unlock()
 	e.applyDelta(old, fresh)
 }
@@ -247,6 +277,7 @@ func (e *Executor) applyDelta(old, fresh exchange.Order) {
 		e.releaseFreeze(fresh)
 		e.mu.Lock()
 		delete(e.orders, fresh.OrderID)
+		e.journalEvent("freeze_release", fresh) // 冻结释放审计留痕（重放不动账本）
 		e.mu.Unlock()
 	} else if inc <= 1e-12 && fresh.Status != old.Status {
 		e.emit(Event{Ts: time.Now(), Kind: string(fresh.Status), Order: fresh})
@@ -312,8 +343,26 @@ func retryable(err error) bool {
 	if err == nil {
 		return false
 	}
+	if exchange.IsRateLimitError(err) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	for _, kw := range []string{"timeout", "connection refused", "eof", "reset by peer", "context deadline", "unexpected"} {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// duplicateOrderErr 识别"clientOrderID 已存在"类错误（不可重试，但订单可能已在途，
+// 必须查后补而不是报失败，防止上层重复下单）。匹配词保守：only 明确的重复语义。
+func duplicateOrderErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, kw := range []string{"already exist", "already submitted", "duplicate", "duplicated", "重复"} {
 		if strings.Contains(msg, kw) {
 			return true
 		}
