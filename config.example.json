@@ -10,7 +10,11 @@
   },
   "trading": {
     "interval": "1H",
-    "slippage_bps": 5
+    "slippage_bps": 5,
+    "fees": {
+      "maker_bps": 8,
+      "taker_bps": 10
+    }
   },
   "risk": {
     "max_order_notional_usd": 1000,
@@ -35,6 +39,14 @@
     "enabled": true,
     "listen": "127.0.0.1:8080",
     "token": ""
+  },
+  "ops": {
+    "equity_watch_sec": 30,
+    "reconcile_sec": 300,
+    "reconcile_tolerance_pct": 0.5,
+    "rest_rate_limit_per_sec": 10,
+    "shutdown_cancel_orders": true,
+    "kill_flatten": false
   },
   "data_dir": "data",
   "ump": {
