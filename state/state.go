@@ -26,6 +26,15 @@ type Runtime struct {
 	KillTripped bool      `json:"kill_tripped"`
 	KillReason  string    `json:"kill_reason"`
 	UMP         []UmpCell `json:"ump,omitempty"` // UMP 拦截器统计快照（重启续用）
+	// Day/DayStartEq 当日权益基线（UTC 日标签 + 日起始权益）：跨重启延续日内回撤
+	// 风控基线——当日已发生的亏损不因进程重启而被"遗忘"导致基线重置。
+	// DayStartEq<=0 视为无基线（research 启动等场景），下次启动按新基线重建。
+	Day        string  `json:"day,omitempty"`
+	DayStartEq float64 `json:"day_start_eq,omitempty"`
+	// StrategyState 策略运行态快照（T6）：当前活跃策略（实现 strategy.Stateful 时）
+	// 的导出 JSON（自包含版本号与配置指纹）。老版本 state 文件无此字段 → nil，
+	// 恢复侧按冷启动处理（版本兼容）。nil 不落盘（omitempty）。
+	StrategyState json.RawMessage `json:"strategy_state,omitempty"`
 }
 
 type Store struct {

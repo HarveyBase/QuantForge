@@ -131,7 +131,15 @@ func (p *Poller) FetchOnce(ctx context.Context, limit int) ([]exchange.Candle, e
 }
 
 // Run 周期轮询直到 ctx 取消。错误不 panic、不静默：记入 Errs 供上层展示。
+// 失败快重试：拉取失败后以 min(failRetryEvery, every) 退避重试而非等满下个周期
+// （1H K 线轮询周期 15 分钟，等满周期意味着断流告警盲区 45 分钟起）。
 func (p *Poller) Run(ctx context.Context, limit int, every time.Duration) {
+	failRetryEvery := every
+	if failRetryEvery > 30*time.Second {
+		failRetryEvery = 30 * time.Second
+	}
+	failTimer := time.NewTimer(0)
+	defer failTimer.Stop()
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
@@ -143,7 +151,14 @@ func (p *Poller) Run(ctx context.Context, limit int, every time.Duration) {
 				if p.OnError != nil {
 					p.OnError(err)
 				}
-				continue
+				failTimer.Reset(failRetryEvery) // 失败后快重试（30s 上限）
+			}
+		case <-failTimer.C:
+			if _, err := p.FetchOnce(ctx, limit); err != nil {
+				if p.OnError != nil {
+					p.OnError(err)
+				}
+				failTimer.Reset(failRetryEvery)
 			}
 		}
 	}

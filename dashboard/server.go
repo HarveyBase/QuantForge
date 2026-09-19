@@ -26,6 +26,7 @@ import (
 	"github.com/HarveyBase/QuantForge/risk"
 	"github.com/HarveyBase/QuantForge/ump"
 	"strconv"
+	"strings"
 )
 
 // Server 后台服务。
@@ -55,6 +56,13 @@ type Server struct {
 	ActiveMode func() config.Mode // 当前活跃环境
 	BootMode   config.Mode        // 启动配置环境（能力上界）
 	SwitchMode func(config.Mode, string) error
+
+	// Reconcile Kill 复位前置对账门禁（P1-1）：返回（结构化报告，配置容差下是否通过，
+	// 拉取错误）。复位前必须先对账——账本与交易所有差异时复位等于带病重启交易。
+	// nil = 无对账能力（research 未装配执行器/账户），复位退回原语义。
+	Reconcile func() (portfolio.ReconcileReport, bool, error)
+	// LastReconcile 最近一次对账报告（/api/status 的 reconcile.last_ts/diffs 数据源）。
+	LastReconcile func() portfolio.ReconcileReport
 
 	mu      sync.Mutex
 	subs    map[chan []byte]struct{}
@@ -181,10 +189,54 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"marks":               marks,
 		"kill_switch":         map[string]any{"tripped": s.Rk.Kill.Tripped(), "reason": s.Rk.Kill.Reason()},
 		"daily_notional_used": s.Rk.DailyNotionalUsed(),
+		"reconcile":           s.reconcileSnapshot(),
 		"regime":              s.regimeSnapshot(),
 		"risk_limits":         s.Cfg.Risk,
 		"uptime_sec":          int(time.Since(s.started).Seconds()),
 	})
+}
+
+// reconcileSnapshot 对账状态（P1-1）：拦截态来自风控（ReconcileBlocked 是下单门禁的
+// 权威状态源），最近报告（时间戳/差异明细）来自注入的 LastReconcile。
+func (s *Server) reconcileSnapshot() map[string]any {
+	blocked, reason := s.Rk.ReconcileBlocked()
+	snap := map[string]any{
+		"ok":      !blocked,
+		"blocked": blocked,
+		"reason":  reason,
+		"last_ts": nil,
+		"diffs":   []portfolio.ReconcileDiff{},
+	}
+	if s.LastReconcile != nil {
+		if rep := s.LastReconcile(); !rep.Ts.IsZero() {
+			diffs := rep.Diffs
+			if diffs == nil {
+				diffs = []portfolio.ReconcileDiff{}
+			}
+			snap["last_ts"] = rep.Ts.UnixMilli()
+			snap["diffs"] = diffs
+		}
+	}
+	return snap
+}
+
+// diffSummary 对账差异摘要（复位 409 响应正文，最多列 5 项防超长）。
+func diffSummary(diffs []portfolio.ReconcileDiff) string {
+	if len(diffs) == 0 {
+		return "（差异明细为空）"
+	}
+	var sb strings.Builder
+	for i, d := range diffs {
+		if i == 5 {
+			fmt.Fprintf(&sb, " …共 %d 项", len(diffs))
+			break
+		}
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		fmt.Fprintf(&sb, "%s %s 本地 %.8f vs 交易所 %.8f (Δ%+.8f)", d.Kind, d.Item, d.Local, d.Remote, d.Diff)
+	}
+	return sb.String()
 }
 
 func (s *Server) regimeSnapshot() any {
@@ -338,6 +390,19 @@ func (s *Server) handleKillSwitch(w http.ResponseWriter, r *http.Request) {
 		if s.Cfg.Mode == config.ModeLive {
 			http.Error(w, "live 模式复位 Kill Switch 需重启进程（最强的门禁）", http.StatusForbidden)
 			return
+		}
+		// 复位前置对账（P1-1）：账本与交易所有差异时复位 = 带病重启交易，拒绝。
+		// research/未装配对账能力（Reconcile==nil）不做前置，维持原语义。
+		if s.Reconcile != nil {
+			rep, ok, rerr := s.Reconcile()
+			switch {
+			case rerr != nil:
+				http.Error(w, fmt.Sprintf("对账无法完成，拒绝复位（%v）——请稍后重试或人工核对", rerr), http.StatusConflict)
+				return
+			case !ok:
+				http.Error(w, fmt.Sprintf("对账未通过，禁止复位 Kill Switch：%s（先核对本地账本与交易所余额）", diffSummary(rep.Diffs)), http.StatusConflict)
+				return
+			}
 		}
 		s.Rk.Kill.Reset()
 		s.Broadcast("kill_switch", map[string]any{"tripped": false})

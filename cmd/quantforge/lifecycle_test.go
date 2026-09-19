@@ -1,0 +1,532 @@
+// lifecycle_test.go 生产实盘改造 T5 的生命周期测试：
+// 启动恢复编排 / 强制对账拦截 / 日内权益基线跨重启 / 优雅退出 / 断流告警。
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/HarveyBase/QuantForge/config"
+	"github.com/HarveyBase/QuantForge/exchange"
+	"github.com/HarveyBase/QuantForge/execution"
+	"github.com/HarveyBase/QuantForge/portfolio"
+	"github.com/HarveyBase/QuantForge/state"
+)
+
+// lifeMock 可变状态的 OKX mock：余额/挂单/最新价可在线调整，撤单计数可观测。
+type lifeMock struct {
+	mu         sync.Mutex
+	usdtTotal  float64
+	usdtAvail  float64
+	btcTotal   float64
+	btcAvail   float64
+	tickerLast float64
+	pending    []map[string]string // okx orders-pending 原始行
+	cancels    int
+	placed     int
+	autoHold   bool // 下单自动进 pending（模拟真实挂单簿）
+}
+
+func newLifeMock() *lifeMock {
+	return &lifeMock{
+		usdtTotal: 10000, usdtAvail: 10000,
+		btcTotal: 0.05, btcAvail: 0.05,
+		tickerLast: 100,
+		autoHold:   true,
+	}
+}
+
+func (m *lifeMock) setBalances(usdtTotal, usdtAvail, btcTotal, btcAvail float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.usdtTotal, m.usdtAvail = usdtTotal, usdtAvail
+	m.btcTotal, m.btcAvail = btcTotal, btcAvail
+}
+
+func (m *lifeMock) setTicker(last float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tickerLast = last
+}
+
+func (m *lifeMock) addPending(row map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending = append(m.pending, row)
+}
+
+func (m *lifeMock) cancelCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cancels
+}
+
+func (m *lifeMock) placeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.placed
+}
+
+// newLifeServer 启动 mock OKX 服务并返回绑定它的 paper 配置。
+func newLifeServer(t *testing.T) (*lifeMock, *config.Config) {
+	t.Helper()
+	t.Setenv("OKX_API_KEY", "k")
+	t.Setenv("OKX_SECRET", "s")
+	t.Setenv("OKX_PASSPHRASE", "p")
+	m := newLifeMock()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v5/public/time", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": []map[string]string{
+			{"ts": fmt.Sprintf("%d", time.Now().UnixMilli())},
+		}})
+	})
+	mux.HandleFunc("/api/v5/market/ticker", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		last := m.tickerLast
+		m.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": []map[string]string{
+			{"instId": "BTC-USDT", "last": fmt.Sprintf("%g", last), "bidPx": fmt.Sprintf("%g", last-0.5),
+				"askPx": fmt.Sprintf("%g", last+0.5), "ts": fmt.Sprintf("%d", time.Now().UnixMilli())},
+		}})
+	})
+	mux.HandleFunc("/api/v5/market/candles", func(w http.ResponseWriter, r *http.Request) {
+		var rows [][]string
+		for i := 300; i >= 1; i-- {
+			ot := int64(3600000 * i)
+			px := 100 + float64(i%7)
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", ot), fmt.Sprintf("%g", px),
+				fmt.Sprintf("%g", px+1), fmt.Sprintf("%g", px-1), fmt.Sprintf("%g", px),
+				"1", "0", "0", "1",
+			})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": rows})
+	})
+	mux.HandleFunc("/api/v5/account/balance", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		usdt, usdtA, btc, btcA := m.usdtTotal, m.usdtAvail, m.btcTotal, m.btcAvail
+		m.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": []map[string]any{{
+			"details": []map[string]string{
+				{"ccy": "USDT", "availBal": fmt.Sprintf("%g", usdtA), "cashBal": fmt.Sprintf("%g", usdt), "frozenBal": fmt.Sprintf("%g", usdt-usdtA)},
+				{"ccy": "BTC", "availBal": fmt.Sprintf("%g", btcA), "cashBal": fmt.Sprintf("%g", btc), "frozenBal": fmt.Sprintf("%g", btc-btcA)},
+			},
+		}}})
+	})
+	mux.HandleFunc("/api/v5/trade/order", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		json.NewDecoder(r.Body).Decode(&body)
+		m.mu.Lock()
+		m.placed++
+		id := fmt.Sprintf("o%d", m.placed)
+		if m.autoHold {
+			m.pending = append(m.pending, map[string]string{
+				"instId": body["instId"], "ordId": id, "clOrdID": body["clOrdID"],
+				"state": "live", "side": body["side"], "ordType": body["ordType"],
+				"px": body["px"], "sz": body["sz"], "accFillSz": "0", "avgPx": "",
+				"cTime": fmt.Sprintf("%d", time.Now().UnixMilli()-60000),
+				"uTime": fmt.Sprintf("%d", time.Now().UnixMilli()),
+			})
+		}
+		m.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": []map[string]string{
+			{"ordId": id, "clOrdID": body["clOrdID"], "sCode": "0", "sMsg": ""},
+		}})
+	})
+	mux.HandleFunc("/api/v5/trade/orders-pending", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		rows := append([]map[string]string(nil), m.pending...)
+		m.mu.Unlock()
+		if rows == nil {
+			rows = []map[string]string{}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": rows})
+	})
+	mux.HandleFunc("/api/v5/trade/cancel-order", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		json.NewDecoder(r.Body).Decode(&body)
+		m.mu.Lock()
+		m.cancels++
+		kept := m.pending[:0]
+		for _, row := range m.pending {
+			if row["ordId"] != body["ordId"] {
+				kept = append(kept, row)
+			}
+		}
+		m.pending = kept
+		m.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": []map[string]string{
+			{"ordId": body["ordId"], "sCode": "0", "sMsg": ""},
+		}})
+	})
+	mux.HandleFunc("/api/v5/public/instruments", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": []map[string]string{
+			{"instId": "BTC-USDT", "baseCcy": "BTC", "quoteCcy": "USDT", "lotSz": "0.00000001", "minSz": "0.00001", "tickSz": "0.1"},
+		}})
+	})
+	srv := httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := config.Default()
+	cfg.Mode = config.ModePaper
+	cfg.Exchange.RestURL = srv.URL
+	cfg.DataDir = t.TempDir()
+	cfg.Ops.RestRateLimitPerSec = 50 // 测试加速（校验范围 [1,50]）
+	return m, cfg
+}
+
+// pendingRow 造一条 okx 在途单原始行。
+func pendingRow(ordID, clOrdID string) map[string]string {
+	return map[string]string{
+		"instId": "BTC-USDT", "ordId": ordID, "clOrdID": clOrdID,
+		"state": "live", "side": "buy", "ordType": "limit",
+		"px": "90", "sz": "0.01", "accFillSz": "0", "avgPx": "",
+		"cTime": "1700000000000", "uTime": "1700000000000",
+	}
+}
+
+// TestStartupRecoveryRestoresJournalAndAdoptsOrphans 启动恢复编排：
+// journal 残留挂单 + 交易所在途单 → 恢复后本地订单簿与交易所一致（孤儿单被认领）。
+func TestStartupRecoveryRestoresJournalAndAdoptsOrphans(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	// journal 残留：上次运行留下的在途单 ex-known
+	jpath := filepath.Join(cfg.DataDir, "state", "orders.jsonl")
+	j, err := execution.NewJournal(jpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Append(execution.JournalEvent{Ts: time.Now(), Ev: "register", Order: exchange.Order{
+		Exchange: "okx", Symbol: "BTC-USDT", OrderID: "ex-known", ClientOrderID: "qf-known",
+		Side: exchange.Buy, Type: exchange.OrderLimit, Price: 90, Qty: 0.01, Status: exchange.StatusSubmitted,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// 交易所在途：ex-known（本地已知，对齐）+ ex-orphan（孤儿单，认领）
+	m.addPending(pendingRow("ex-known", "qf-known"))
+	m.addPending(pendingRow("ex-orphan", "manual-1"))
+
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	open := a.exec.OpenOrders()
+	got := map[string]bool{}
+	for _, o := range open {
+		got[o.OrderID] = true
+	}
+	if !got["ex-known"] || !got["ex-orphan"] {
+		t.Fatalf("启动恢复后订单簿应含 journal 残留单与交易所孤儿单: %+v", open)
+	}
+	// 幂等键被认领：重启后不得重复使用同一 clientOrderID（防重复下单）
+	if _, err := a.exec.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 90, Qty: 0.01, ClientOrderID: "qf-known",
+	}); err == nil {
+		t.Fatal("journal 恢复的 clientOrderID 必须标记 claimed 防重发")
+	}
+	// 采纳事件留痕（journal 落 adopted，审计可查）
+	events, skipped, err := execution.LoadJournal(jpath)
+	if err != nil || skipped != 0 {
+		t.Fatalf("journal 重读失败: %v skipped=%d", err, skipped)
+	}
+	adopted := 0
+	for _, ev := range events {
+		if ev.Ev == "adopted" && ev.Order.OrderID == "ex-orphan" {
+			adopted++
+		}
+	}
+	if adopted != 1 {
+		t.Fatalf("孤儿单认领必须在 journal 留 adopted 事件: %d", adopted)
+	}
+}
+
+// TestForcedReconcileBlocksAndClears 强制对账：构造差异 → blocked + 下单被
+// RECONCILE_BLOCK 拦截；恢复一致 → 拦截自动解除。
+func TestForcedReconcileBlocksAndClears(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	cfg.Risk.CooldownAfterRejectSec = 0 // 拒单默认带 30s 冷静期，会盖住"解除后可下单"断言
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	if blocked, _ := a.rk.ReconcileBlocked(); blocked {
+		t.Fatal("启动对账一致（mock 余额与 Seed 一致）不应拦截")
+	}
+	// 构造差异：远程 USDT 少 2000（20% >> 容差 0.5%）
+	m.setBalances(8000, 8000, 0.05, 0.05)
+	rep, ok, err := a.reconcileOnce(context.Background())
+	if err != nil || ok {
+		t.Fatalf("余额差异必须判不通过: ok=%v err=%v diffs=%+v", ok, err, rep.Diffs)
+	}
+	blocked, reason := a.rk.ReconcileBlocked()
+	if !blocked || !strings.Contains(reason, "USDT") {
+		t.Fatalf("差异必须触发对账拦截: blocked=%v reason=%q", blocked, reason)
+	}
+	// 下单被拦截（任何模式不得绕过风控）
+	_, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 50, Qty: 0.1, ClientOrderID: "t-reconcile-1",
+	})
+	if serr == nil || !strings.Contains(serr.Error(), "RECONCILE_BLOCK") {
+		t.Fatalf("对账拦截期间下单必须被拒: %v", serr)
+	}
+	// 恢复一致 → 自动解除
+	m.setBalances(10000, 10000, 0.05, 0.05)
+	if _, ok, err := a.reconcileOnce(context.Background()); err != nil || !ok {
+		t.Fatalf("恢复一致应判通过: ok=%v err=%v", ok, err)
+	}
+	if blocked, _ := a.rk.ReconcileBlocked(); blocked {
+		t.Fatal("恢复一致后拦截必须解除")
+	}
+	if _, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 50, Qty: 0.1, ClientOrderID: "t-reconcile-2",
+	}); serr != nil {
+		t.Fatalf("解除拦截后下单应恢复: %v", serr)
+	}
+}
+
+// TestDayStartEquityContinuity 日内权益基线跨重启：同日用旧基线延续、跨日重置。
+// mock ticker=100 → Seed 权益 = 10000 现金 + 0.05 BTC × 100 = 10005（mark 接线后
+// 基线即刻含持仓市值）。
+func TestDayStartEquityContinuity(t *testing.T) {
+	today := time.Now().UTC().Format("2006-01-02")
+
+	// 第一次启动：基线落盘
+	_, cfg1 := newLifeServer(t)
+	a1, err := buildApp(cfg1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a1.exec.Stop()
+	day, eq := a1.rk.EquityBaseline()
+	if day != today || eq != 10005 {
+		t.Fatalf("Seed 后基线应为今日 %.2f（mark=100 含持仓市值）: %s %.2f", 10005.0, day, eq)
+	}
+	// 第二次启动（同 dataDir、同日）：基线延续落盘值
+	_, cfg2 := newLifeServer(t)
+	cfg2.DataDir = cfg1.DataDir // 复用同一 state 目录
+	tamper := state.Runtime{Version: 1, Day: today, DayStartEq: 7777}
+	if err := state.New(cfg2.DataDir).Save(tamper); err != nil {
+		t.Fatal(err)
+	}
+	a2, err := buildApp(cfg2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.exec.Stop()
+	if day, eq := a2.rk.EquityBaseline(); day != today || eq != 7777 {
+		t.Fatalf("同日重启必须延续旧基线 7777: %s %.2f", day, eq)
+	}
+	// 第三次启动（state 里是昨日）：基线重置为 Seed 后真实权益
+	m3, cfg3 := newLifeServer(t)
+	cfg3.DataDir = cfg1.DataDir
+	m3.setTicker(200) // 新价 → 新基线 10000 + 0.05×200 = 10010
+	if err := state.New(cfg3.DataDir).Save(state.Runtime{Version: 1, Day: "2000-01-01", DayStartEq: 7777}); err != nil {
+		t.Fatal(err)
+	}
+	a3, err := buildApp(cfg3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a3.exec.Stop()
+	if day, eq := a3.rk.EquityBaseline(); day != today || eq != 10010 {
+		t.Fatalf("跨日重启必须重置基线为当前权益 10010: %s %.2f", day, eq)
+	}
+}
+
+// TestGracefulShutdownCancelsAndPersists 优雅退出：撤单被执行 + 最新态落盘。
+func TestGracefulShutdownCancelsAndPersists(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+			Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+			Price: 50, Qty: 0.1, ClientOrderID: fmt.Sprintf("t-shutdown-%d", i),
+		}); serr != nil {
+			t.Fatalf("前置下单失败: %v", serr)
+		}
+	}
+	if n := len(a.exec.OpenOrders()); n != 2 {
+		t.Fatalf("前置失败：应有 2 张挂单: %d", n)
+	}
+	a.gracefulShutdown(nil)
+	if c := m.cancelCount(); c != 2 {
+		t.Fatalf("优雅退出应撤掉全部挂单: %d", c)
+	}
+	if n := len(a.exec.OpenOrders()); n != 0 {
+		t.Fatalf("撤单后订单簿应清空: %d", n)
+	}
+	// state 落盘（含日内基线）
+	st, err := a.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Day != time.Now().UTC().Format("2006-01-02") || st.DayStartEq != 10005 {
+		t.Fatalf("退出落盘应含日内基线: %+v", st)
+	}
+}
+
+// TestGracefulShutdownKeepsOrdersWhenConfigured ShutdownCancelOrders=false：
+// 挂单留守（重启后由 AdoptOpenOrders 认领），不撤单。
+func TestGracefulShutdownKeepsOrdersWhenConfigured(t *testing.T) {
+	m, cfg := newLifeServer(t)
+	cfg.Ops.ShutdownCancelOrders = false
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, serr := a.exec.Submit(context.Background(), exchange.OrderRequest{
+		Symbol: "BTC-USDT", Side: exchange.Buy, Type: exchange.OrderLimit,
+		Price: 50, Qty: 0.1, ClientOrderID: "t-keep-1",
+	}); serr != nil {
+		t.Fatalf("前置下单失败: %v", serr)
+	}
+	a.gracefulShutdown(nil)
+	if c := m.cancelCount(); c != 0 {
+		t.Fatalf("shutdown_cancel_orders=false 不得撤单: %d", c)
+	}
+	if n := len(a.exec.OpenOrders()); n != 1 {
+		t.Fatalf("挂单应留守: %d", n)
+	}
+}
+
+// captureNotifier 测试用告警捕获器。
+type captureNotifier struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (c *captureNotifier) Send(text string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgs = append(c.msgs, text)
+}
+func (c *captureNotifier) Enabled() bool { return true }
+func (c *captureNotifier) sent() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.msgs...)
+}
+
+// TestFeedErrorAlerting 断流计数器：3 次失败告警（节流内不重复）、恢复清零。
+func TestFeedErrorAlerting(t *testing.T) {
+	cfg := mockOKX(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &captureNotifier{}
+	a.notifier = cap
+	// 1-2 次失败：计数但未到阈值
+	a.onFeedError(errors.New("timeout 1"))
+	a.onFeedError(errors.New("timeout 2"))
+	if got := cap.sent(); len(got) != 0 {
+		t.Fatalf("未达 3 次不应告警: %v", got)
+	}
+	// 第 3 次：告警
+	a.onFeedError(errors.New("timeout 3"))
+	msgs := cap.sent()
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "连续失败 3 次") {
+		t.Fatalf("第 3 次失败应告警: %v", msgs)
+	}
+	// 第 4 次：仍在节流窗内，不重复告警（计数继续涨）
+	a.onFeedError(errors.New("timeout 4"))
+	if got := cap.sent(); len(got) != 1 {
+		t.Fatalf("10 分钟节流窗内不应重复告警: %v", got)
+	}
+	if n := a.feedErrs.Load(); n != 4 {
+		t.Fatalf("连续失败计数应为 4: %d", n)
+	}
+	// 恢复（下一次成功拉取）：计数清零
+	a.onFeedUpdate(nil)
+	if n := a.feedErrs.Load(); n != 0 {
+		t.Fatalf("恢复后计数应清零: %d", n)
+	}
+	// 再失败 1 次：从头计数，不告警
+	a.onFeedError(errors.New("timeout 5"))
+	if got := cap.sent(); len(got) != 1 {
+		t.Fatalf("恢复后单次失败不应告警: %v", got)
+	}
+}
+
+// TestAlertThrottleWindow 节流器窗口语义单测。
+func TestAlertThrottleWindow(t *testing.T) {
+	th := alertThrottle{every: 30 * time.Millisecond}
+	if !th.allow() {
+		t.Fatal("首次应放行")
+	}
+	if th.allow() {
+		t.Fatal("窗口内第二次应拒绝")
+	}
+	time.Sleep(40 * time.Millisecond)
+	if !th.allow() {
+		t.Fatal("窗口过后应再次放行")
+	}
+}
+
+// TestReconcileWithinTolerance 对账容差判定层单测：内禀 Ok 直接过、粉尘豁免、
+// 配置容差内放行、超容差拒绝。
+func TestReconcileWithinTolerance(t *testing.T) {
+	if !reconcileWithinTolerance(portfolio.ReconcileReport{Ok: true}, 0.5) {
+		t.Fatal("Ok=true 应直接通过")
+	}
+	// 粉尘（0.3 USDT）：放行
+	dust := portfolio.ReconcileReport{Diffs: []portfolio.ReconcileDiff{{Kind: "cash", Item: "USDT", Local: 10000, Remote: 10000.3, Diff: 0.3}}}
+	if !reconcileWithinTolerance(dust, 0.5) {
+		t.Fatal("粉尘级差异（≤0.5）应豁免")
+	}
+	// 容差内（0.4% < 0.5%）：放行
+	small := portfolio.ReconcileReport{Diffs: []portfolio.ReconcileDiff{{Kind: "position", Item: "BTC-USDT", Local: 1, Remote: 1.004, Diff: 0.004}}}
+	if !reconcileWithinTolerance(small, 0.5) {
+		t.Fatal("配置容差内的差异应放行")
+	}
+	// 超容差（20%）：拒绝
+	big := portfolio.ReconcileReport{Diffs: []portfolio.ReconcileDiff{{Kind: "cash", Item: "USDT", Local: 10000, Remote: 8000, Diff: -2000}}}
+	if reconcileWithinTolerance(big, 0.5) {
+		t.Fatal("超容差差异必须拒绝")
+	}
+	// 一项放行一项超限：整体拒绝
+	mixed := portfolio.ReconcileReport{Diffs: []portfolio.ReconcileDiff{
+		{Kind: "cash", Item: "USDT", Local: 10000, Remote: 10000.3, Diff: 0.3},
+		{Kind: "cash", Item: "USDT", Local: 10000, Remote: 8000, Diff: -2000},
+	}}
+	if reconcileWithinTolerance(mixed, 0.5) {
+		t.Fatal("任一差异超容差即整体拒绝")
+	}
+}
+
+// TestStartupPersistsStateImmediately 交易模式启动即落盘（防启动后崩溃丢基线）。
+func TestStartupPersistsStateImmediately(t *testing.T) {
+	_, cfg := newLifeServer(t)
+	a, err := buildApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.exec.Stop()
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "state", "runtime.json")); err != nil {
+		t.Fatalf("paper 启动后 state 应立即落盘: %v", err)
+	}
+	st, err := a.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Day == "" || st.DayStartEq != 10005 {
+		t.Fatalf("落盘应含日内基线: %+v", st)
+	}
+}
