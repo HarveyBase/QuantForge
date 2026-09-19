@@ -4,6 +4,9 @@
 package strategy
 
 import (
+	"encoding/json"
+	"fmt"
+
 	"github.com/HarveyBase/QuantForge/exchange"
 )
 
@@ -12,6 +15,8 @@ import (
 type Composite struct {
 	subs []subStrategy
 }
+
+var _ Stateful = (*Composite)(nil)
 
 type subStrategy struct {
 	name    string
@@ -95,6 +100,75 @@ func (c *Composite) Describe() string {
 		} else {
 			out += sub.name + state
 		}
+	}
+	return out
+}
+
+// ExportState 组合运行态 = 各 Stateful 子策略运行态的按名映射 {"grid": {...}, "trend": {...}}。
+// 不实现 Stateful 的子策略不出现在导出里（冷启动语义）。enabled（regime 路由开关）是
+// 派生自行情的瞬时态，不属于运行态，不导出——重启后由 regimeDet 重新识别。
+func (c *Composite) ExportState() (json.RawMessage, error) {
+	out := make(map[string]json.RawMessage, len(c.subs))
+	for _, sub := range c.subs {
+		s, ok := sub.s.(Stateful)
+		if !ok {
+			continue
+		}
+		raw, err := s.ExportState()
+		if err != nil {
+			return nil, fmt.Errorf("composite: 子策略 %s 导出失败: %w", sub.name, err)
+		}
+		out[sub.name] = raw
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("composite: 序列化失败: %w", err)
+	}
+	return b, nil
+}
+
+// ImportState 导入组合运行态：子策略名集合必须与当前装配一致（配置漂移防护），
+// 逐个子策略导入；任一失败整体报错（由调用方决定冷启动）。
+func (c *Composite) ImportState(raw json.RawMessage) error {
+	var in map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return fmt.Errorf("composite: 解析失败: %w", err)
+	}
+	subs := make(map[string]Stateful, len(c.subs))
+	for _, sub := range c.subs {
+		if s, ok := sub.s.(Stateful); ok {
+			subs[sub.name] = s
+		}
+	}
+	if len(in) != len(subs) {
+		return fmt.Errorf("composite: 子策略集合与持久化状态不一致（配置漂移）：状态含 %v，当前 Stateful 子策略 %v", keys(in), keysOf(subs))
+	}
+	for name, subRaw := range in {
+		s, ok := subs[name]
+		if !ok {
+			return fmt.Errorf("composite: 持久化状态含未知子策略 %q（配置漂移）", name)
+		}
+		if err := s.ImportState(subRaw); err != nil {
+			return fmt.Errorf("composite: 子策略 %s 导入失败: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// keys map 键列表（错误信息用）。
+func keys(m map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// keysOf Stateful 子策略名列表（错误信息用）。
+func keysOf(m map[string]Stateful) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
 	return out
 }
