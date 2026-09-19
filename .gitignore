@@ -62,4 +62,4 @@ data/state/
 data/candles.db*
 
 # 构建产物
-quantforge
+/quantforge
