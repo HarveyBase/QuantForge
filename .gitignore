@@ -63,3 +63,6 @@ data/candles.db*
 
 # 构建产物
 /quantforge
+
+# 散落的日志文件
+*.log
